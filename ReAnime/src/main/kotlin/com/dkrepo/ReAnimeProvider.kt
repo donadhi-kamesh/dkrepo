@@ -1,6 +1,5 @@
 package com.dkrepo
 
-import androidx.annotation.Keep
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.DeserializationFeature
@@ -25,8 +24,7 @@ class ReAnimeProvider : MainAPI() {
          * Dedicated Jackson mapper for reanime.to.
          * Cloudstream's AppUtils.parseJson tries kotlinx first and its shared
          * Jackson mapper can silently drop snake_case keys (anilist_id -> 0).
-         * We also keep every response class with @Keep so R8 doesn't obfuscate
-         * the @JsonProperty names.
+         * We rely on explicit @JsonProperty so R8 obfuscation does not affect mapping.
          */
         private val apiMapper: ObjectMapper = jacksonObjectMapper().apply {
             this.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -244,7 +242,6 @@ class ReAnimeProvider : MainAPI() {
     }
     // ---------- API data classes (kept from R8) ----------
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class TitleData(
         @JsonProperty("english") val english: String? = null,
@@ -252,7 +249,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("romaji") val romaji: String? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class CoverImageData(
         @JsonProperty("extra_large") val extraLarge: String? = null,
@@ -260,7 +256,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("medium") val medium: String? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class AnimeSearchItem(
         @JsonProperty("anime_id") val animeId: String? = null,
@@ -269,31 +264,26 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("format") val format: String? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class SearchApiResponse(
         @JsonProperty("results") val results: List<AnimeSearchItem>? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class TopAnimeResponse(
         @JsonProperty("data") val data: List<AnimeSearchItem>? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class ScheduleDay(
         @JsonProperty("episodes") val episodes: List<AnimeSearchItem>? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class ScheduleApiResponse(
         @JsonProperty("schedule") val schedule: List<ScheduleDay>? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class RelationItem(
         @JsonProperty("anime_id") val animeId: String? = null,
@@ -303,13 +293,11 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("relation_type") val relationType: String? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class ExternalSeasons(
         @JsonProperty("tmdb") val tmdb: Int? = null,
         @JsonProperty("tvdb") val tvdb: Int? = null
     )
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class AnimeDetailsResponse(
         @JsonProperty("anime_id") val animeId: String? = null,
@@ -333,7 +321,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("relations") val relations: List<RelationItem>? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class EpisodeItem(
         @JsonProperty("episodeId") val episodeId: String? = null,
@@ -346,7 +333,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("is_recap") val isRecap: Boolean? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class EpisodesResponse(
         @JsonProperty("data") val data: List<EpisodeItem>? = null,
@@ -354,7 +340,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("totalPages") val totalPages: Int? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class FlixServer(
         @JsonProperty("serverName") val serverName: String? = null,
@@ -363,7 +348,6 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("softsub") val softsub: Boolean? = null
     )
 
-    @Keep
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class FlixResponse(
         @JsonProperty("success") val success: Boolean? = null,
