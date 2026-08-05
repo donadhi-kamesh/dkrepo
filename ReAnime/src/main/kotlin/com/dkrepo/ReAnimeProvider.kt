@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import org.jsoup.Jsoup
+import java.net.URLEncoder
 
 class ReAnimeProvider : MainAPI() {
     override var mainUrl = "https://reanime.to"
@@ -79,7 +80,8 @@ class ReAnimeProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/api/v1/search?q=${query.encodeUri()}"
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        val url = "$mainUrl/api/v1/search?q=$encodedQuery"
         val response = app.get(url).text
         val parsed = parseJson<SearchApiResponse>(response)
 

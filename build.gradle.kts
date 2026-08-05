@@ -1,4 +1,6 @@
+import com.android.build.gradle.LibraryExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 buildscript {
     repositories {
@@ -24,6 +26,9 @@ allprojects {
 fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
     extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
 
+fun Project.android(configuration: LibraryExtension.() -> Unit) =
+    extensions.getByName<LibraryExtension>("android").configuration()
+
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
@@ -46,7 +51,7 @@ subprojects {
         }
     }
 
-    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+    tasks.withType<KotlinCompile> {
         kotlinOptions {
             jvmTarget = "1.8"
             freeCompilerArgs = freeCompilerArgs + listOf(
@@ -59,16 +64,15 @@ subprojects {
     }
 
     dependencies {
-        val cloudstream by configurations
-        val implementation by configurations
+        val cloudstream = configurations.getByName("cloudstream")
+        val implementation = configurations.getByName("implementation")
 
         cloudstream("com.github.recloudstream:cloudstream:master-SNAPSHOT")
-
         implementation("org.jsoup:jsoup:1.17.2")
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.16.1")
     }
 }
 
-task<Delete>("clean") {
-    delete(rootProject.buildDir)
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
 }
