@@ -190,12 +190,12 @@ class ReAnimeProvider : MainAPI() {
                 this.plot = description
                 this.year = year
                 this.showStatus = status
-                this.genres = details.genres
+                this.tags = details.genres
                 if (recommendationsList != null) {
                     this.recommendations = recommendationsList
                 }
                 if (subEpisodes.isNotEmpty()) {
-                    addEpisodes(DubStatus.Subed, subEpisodes)
+                    addEpisodes(DubStatus.Subbed, subEpisodes)
                 }
                 if (dubEpisodes.isNotEmpty()) {
                     addEpisodes(DubStatus.Dubbed, dubEpisodes)
@@ -223,7 +223,7 @@ class ReAnimeProvider : MainAPI() {
             return newAnimeLoadResponse(title, url, TvType.Anime) {
                 this.posterUrl = poster
                 this.plot = plot
-                addEpisodes(DubStatus.Subed, episodesList.distinctBy { it.episode })
+                addEpisodes(DubStatus.Subbed, episodesList.distinctBy { it.episode })
             }
         }
     }
@@ -249,14 +249,15 @@ class ReAnimeProvider : MainAPI() {
         doc.select("video source[src], video[src]").forEach { video ->
             val src = fixUrl(video.attr("src"))
             if (src.isNotEmpty()) {
+                val isM3u8 = src.contains(".m3u8")
                 callback(
                     ExtractorLink(
-                        this.name,
-                        this.name,
-                        src,
-                        data,
-                        getQualityFromName(video.attr("res") ?: "720p"),
-                        isM3u8 = src.contains(".m3u8")
+                        source = this.name,
+                        name = this.name,
+                        url = src,
+                        referer = data,
+                        quality = getQualityFromName(video.attr("res") ?: "720p"),
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     )
                 )
                 count++
@@ -267,14 +268,15 @@ class ReAnimeProvider : MainAPI() {
         m3u8Regex.findAll(watchHtml).forEach { match ->
             val streamUrl = match.value
             if (!streamUrl.contains("favicon") && !streamUrl.contains("logo") && !streamUrl.contains("banner")) {
+                val isM3u8 = streamUrl.contains(".m3u8")
                 callback(
                     ExtractorLink(
-                        this.name,
-                        if (streamUrl.contains(".m3u8")) "HLS Stream" else "MP4 Video",
-                        streamUrl,
-                        data,
-                        Qualities.Unknown.value,
-                        isM3u8 = streamUrl.contains(".m3u8")
+                        source = this.name,
+                        name = if (isM3u8) "HLS Stream" else "MP4 Video",
+                        url = streamUrl,
+                        referer = data,
+                        quality = Qualities.Unknown.value,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     )
                 )
                 count++
