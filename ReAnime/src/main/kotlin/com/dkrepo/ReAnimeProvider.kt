@@ -127,7 +127,7 @@ class ReAnimeProvider : MainAPI() {
             emptyList()
         }
 
-        fun epData(epNum: Int) = "$anilistId|$tmdbId|$tmdbSeason|$epNum"
+        fun epData(epNum: Int) = "$animeId|$anilistId|$tmdbId|$tmdbSeason|$epNum"
 
         val subEpisodes = if (episodes.isNotEmpty()) {
             episodes.map { ep ->
@@ -194,12 +194,45 @@ class ReAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // episode data layout: anilistId|tmdbId|tmdbSeason|episodeNumber
+        Log.i("ReAnime", "loadLinks data=$data")
+        // episode data layouts:
+        // new: animeId|anilistId|tmdbId|tmdbSeason|episodeNumber
+        // old (cached): anilistId|tmdbId|tmdbSeason|episodeNumber
         val parts = data.split("|")
-        val anilistId = parts.getOrNull(0)?.toIntOrNull() ?: 0
-        val tmdbId = parts.getOrNull(1)?.toIntOrNull() ?: 0
-        val tmdbSeason = parts.getOrNull(2)?.toIntOrNull() ?: 1
-        val epNum = parts.getOrNull(3)?.toIntOrNull() ?: 1
+        var animeId = ""
+        var anilistId: Int
+        var tmdbId: Int
+        var tmdbSeason: Int
+        var epNum: Int
+        if (parts.size >= 5) {
+            animeId = parts[0]
+            anilistId = parts[1].toIntOrNull() ?: 0
+            tmdbId = parts[2].toIntOrNull() ?: 0
+            tmdbSeason = parts[3].toIntOrNull() ?: 1
+            epNum = parts[4].toIntOrNull() ?: 1
+        } else {
+            anilistId = parts.getOrNull(0)?.toIntOrNull() ?: 0
+            tmdbId = parts.getOrNull(1)?.toIntOrNull() ?: 0
+            tmdbSeason = parts.getOrNull(2)?.toIntOrNull() ?: 1
+            epNum = parts.getOrNull(3)?.toIntOrNull() ?: 1
+        }
+
+        // stale-cache fallback: if both ids are 0 but we have animeId, refetch details
+        if (anilistId == 0 && tmdbId == 0 && animeId.isNotBlank()) {
+            try {
+                val details = parseApi(
+                    app.get("$mainUrl/api/v1/anime/$animeId").text,
+                    AnimeDetailsResponse::class.java
+                )
+                anilistId = details.anilistId ?: 0
+                tmdbId = details.themoviedbId ?: 0
+                if (anilistId != 0 || tmdbId != 0) {
+                    Log.i("ReAnime", "loadLinks refetched $animeId -> anilistId=$anilistId tmdbId=$tmdbId")
+                }
+            } catch (e: Exception) {
+                Log.w("ReAnime", "loadLinks refetch failed for $animeId: ${e.message}")
+            }
+        }
 
         val flixUrl = if (anilistId > 0) {
             "$mainUrl/api/flix/$anilistId/$epNum"
