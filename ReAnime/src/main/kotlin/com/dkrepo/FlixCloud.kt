@@ -92,6 +92,7 @@ class FlixCloud : ExtractorApi() {
 
         var quality = Qualities.Unknown.value
         var targetUrl = masterUrl
+        var unwrappedMasterForLater: String? = null
         try {
             val raw = app.get(masterUrl, referer = "$mainUrl/", headers = headers).text
             val trimmed = raw.trim()
@@ -100,6 +101,7 @@ class FlixCloud : ExtractorApi() {
             val text = unwrapped.trim()
             if (text.startsWith("#EXTM3U")) {
                 quality = parseMasterQuality(text)
+                unwrappedMasterForLater = text
                 if (!trimmed.startsWith("#EXTM3U") && text != trimmed) {
                     // wrapped master -> pick best variant so ExoPlayer gets playable URL
                     extractBestVariant(text, masterUrl)?.let {
@@ -110,6 +112,28 @@ class FlixCloud : ExtractorApi() {
             }
         } catch (e: Exception) {
             Log.w(TAG, "master probe failed: ${e.message}")
+        }
+
+        // If target is a media playlist (video.m3u8) that is itself wrapped, unwrap it and
+        // resolve its segments to absolute URLs, then serve via data URI so ExoPlayer sees plain m3u8
+        try {
+            // Only probe if target looks like a media playlist candidate (video.m3u8 or similar)
+            // Fetch it once to check if it's wrapped
+            val probe = app.get(targetUrl, referer = "$mainUrl/", headers = headers).text.trim()
+            if (!probe.startsWith("#EXTM3U")) {
+                val unwrappedVariant = wasmKey?.let { xorUnwrap(probe, it) }?.trim() ?: ""
+                if (unwrappedVariant.startsWith("#EXTM3U")) {
+                    Log.i(TAG, "variant wrapped, unwrapping for playback")
+                    // Fix relative segment URLs in media playlist
+                    val fixed = fixMediaPlaylist(unwrappedVariant, targetUrl)
+                    // Data URI with base64 - ExoPlayer handles data: application/vnd.apple.mpegurl
+                    val b64 = android.util.Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                    targetUrl = "data:application/vnd.apple.mpegurl;base64,$b64"
+                    Log.i(TAG, "using data URI for unwrapped variant")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "variant unwrap probe failed: ${e.message}")
         }
 
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
@@ -283,6 +307,21 @@ class FlixCloud : ExtractorApi() {
             else java.net.URL(java.net.URL(baseUrl), bestUrl).toString()
         } catch (e: Exception) {
             bestUrl
+        }
+    }
+
+    /** Fixes relative segment/key URLs in a media playlist to be absolute against baseUrl. */
+    private fun fixMediaPlaylist(mediaText: String, baseUrl: String): String {
+        val base = try { java.net.URL(baseUrl) } catch (e: Exception) { return mediaText }
+        return mediaText.lines().joinToString("\n") { line ->
+            val t = line.trim()
+            when {
+                t.isEmpty() || t.startsWith("#") -> line
+                t.startsWith("http") -> line
+                else -> try {
+                    java.net.URL(base, t).toString()
+                } catch (e: Exception) { line }
+            }
         }
     }
 
