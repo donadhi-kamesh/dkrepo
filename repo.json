@@ -1,0 +1,8 @@
+{
+  "name": "dkrepo",
+  "description": "Cloudstream extension Repository by dkrepo",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/plugins.json"
+  ]
+}
