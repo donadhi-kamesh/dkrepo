@@ -7,5 +7,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 class ReAnimePlugin : BasePlugin() {
     override fun load() {
         registerMainAPI(ReAnimeProvider())
+        registerExtractorAPI(FlixCloud())
     }
 }
