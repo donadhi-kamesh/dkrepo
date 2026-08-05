@@ -136,6 +136,7 @@ class ReAnimeProvider : MainAPI() {
             val banner = details.bannerImage?.ifEmpty { null }
             val description = details.description
             val year = details.seasonYear
+            val malId = details.malId ?: 0
             val status = when (details.status?.lowercase()) {
                 "releasing" -> ShowStatus.Ongoing
                 "finished" -> ShowStatus.Completed
@@ -151,7 +152,7 @@ class ReAnimeProvider : MainAPI() {
             if (subCount > 0) {
                 for (epNum in 1..subCount) {
                     subEpisodes.add(
-                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&lang=sub") {
+                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&mal=$malId&lang=sub") {
                             this.name = "Episode $epNum"
                             this.episode = epNum
                         }
@@ -162,8 +163,8 @@ class ReAnimeProvider : MainAPI() {
             if (dubCount > 0) {
                 for (epNum in 1..dubCount) {
                     dubEpisodes.add(
-                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&lang=dub") {
-                            this.name = "Episode $epNum (Dub)"
+                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&mal=$malId&lang=dub") {
+                            this.name = "Episode $epNum"
                             this.episode = epNum
                         }
                     )
@@ -234,52 +235,78 @@ class ReAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val watchHtml = app.get(data).text
-        val doc = Jsoup.parse(watchHtml)
         var count = 0
 
-        doc.select("iframe[src]").forEach { iframe ->
-            val src = fixUrl(iframe.attr("src"))
-            if (src.isNotEmpty()) {
-                loadExtractor(src, data, subtitleCallback, callback)
-                count++
+        val epNum = data.substringAfter("ep=", "").substringBefore("&").toIntOrNull() ?: 1
+        val malId = data.substringAfter("mal=", "").substringBefore("&").toIntOrNull() ?: 0
+
+        // 1. Primary: Extract directly from reanime.to watch page
+        try {
+            val watchHtml = app.get(data).text
+            val doc = Jsoup.parse(watchHtml)
+
+            doc.select("iframe[src]").forEach { iframe ->
+                val src = fixUrl(iframe.attr("src"))
+                if (src.isNotEmpty()) {
+                    loadExtractor(src, data, subtitleCallback, callback)
+                    count++
+                }
             }
+
+            doc.select("video source[src], video[src]").forEach { video ->
+                val src = fixUrl(video.attr("src"))
+                if (src.isNotEmpty()) {
+                    val isM3u8 = src.contains(".m3u8")
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = this.name,
+                            url = src,
+                            referer = data,
+                            quality = getQualityFromName(video.attr("res") ?: "720p"),
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        )
+                    )
+                    count++
+                }
+            }
+
+            val m3u8Regex = Regex("""https?://[^\s"']+\.(?:m3u8|mp4)[^\s"']*""")
+            m3u8Regex.findAll(watchHtml).forEach { match ->
+                val streamUrl = match.value
+                if (!streamUrl.contains("favicon") && !streamUrl.contains("logo") && !streamUrl.contains("banner")) {
+                    val isM3u8 = streamUrl.contains(".m3u8")
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = if (isM3u8) "HLS Stream" else "MP4 Video",
+                            url = streamUrl,
+                            referer = data,
+                            quality = Qualities.Unknown.value,
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        )
+                    )
+                    count++
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
 
-        doc.select("video source[src], video[src]").forEach { video ->
-            val src = fixUrl(video.attr("src"))
-            if (src.isNotEmpty()) {
-                val isM3u8 = src.contains(".m3u8")
-                callback(
-                    ExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = src,
-                        referer = data,
-                        quality = getQualityFromName(video.attr("res") ?: "720p"),
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    )
-                )
-                count++
-            }
-        }
-
-        val m3u8Regex = Regex("""https?://[^\s"']+\.(?:m3u8|mp4)[^\s"']*""")
-        m3u8Regex.findAll(watchHtml).forEach { match ->
-            val streamUrl = match.value
-            if (!streamUrl.contains("favicon") && !streamUrl.contains("logo") && !streamUrl.contains("banner")) {
-                val isM3u8 = streamUrl.contains(".m3u8")
-                callback(
-                    ExtractorLink(
-                        source = this.name,
-                        name = if (isM3u8) "HLS Stream" else "MP4 Video",
-                        url = streamUrl,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    )
-                )
-                count++
+        // 2. Fallback: If reanime.to has no direct streams yet, extract via MAL ID from public video extractors
+        if (count == 0 && malId > 0) {
+            val vidsrcUrls = listOf(
+                "https://vidsrc.me/embed/anime?mal=$malId&ep=$epNum",
+                "https://vidsrc.to/embed/anime/$malId/$epNum",
+                "https://vidsrc.cc/v2/embed/anime/$malId/$epNum"
+            )
+            for (vurl in vidsrcUrls) {
+                try {
+                    loadExtractor(vurl, data, subtitleCallback, callback)
+                    count++
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
         }
 
@@ -343,6 +370,7 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("last_episode") val lastEpisode: Int? = null,
         @JsonProperty("subbed") val subbed: Int? = null,
         @JsonProperty("dubbed") val dubbed: Int? = null,
+        @JsonProperty("mal_id") val malId: Int? = null,
         @JsonProperty("relations") val relations: List<RelationItem>? = null
     )
 }
