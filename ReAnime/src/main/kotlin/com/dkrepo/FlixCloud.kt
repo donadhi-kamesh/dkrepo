@@ -2,6 +2,7 @@ package com.dkrepo
 
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.USER_AGENT
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64DecodeArray
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -60,9 +61,17 @@ class FlixCloud : ExtractorApi() {
         emitSubtitles: Boolean,
         serverLabel: String? = null
     ) {
-        val html = app.get(url, referer = PARENT_REFERER).text
+        Log.i(TAG, "extract start for $url")
+        val headers = mapOf("User-Agent" to USER_AGENT)
+        val html = try {
+            app.get(url, referer = PARENT_REFERER, headers = headers).text
+        } catch (e: Exception) {
+            Log.w(TAG, "embed fetch failed: ${e.message}")
+            return
+        }
+        Log.i(TAG, "embed html length=${html.length}")
         val data = findDataObject(html) ?: run {
-            Log.w(TAG, "no kit.start data object on $url")
+            Log.w(TAG, "no kit.start data object on $url (html len ${html.length}, has seed=${html.contains("obfuscation_seed")})")
             return
         }
 
@@ -79,13 +88,14 @@ class FlixCloud : ExtractorApi() {
             Log.w(TAG, "decryption failed for $url")
             return
         }
+        Log.i(TAG, "decrypted master url: ${masterUrl.take(90)}")
 
         // Best-effort quality detection. The CDN may serve the master either
         // plain or XOR-wrapped (wrapped still gives quality via _c key unwrap),
         // but the stream URL is always emitted so the player can try it.
         var quality = Qualities.Unknown.value
         try {
-            val master = app.get(masterUrl, referer = "$mainUrl/").text
+            val master = app.get(masterUrl, referer = "$mainUrl/", headers = headers).text
             val masterText = if (master.startsWith("#EXTM3U")) master
                 else wasmKey?.let { xorUnwrap(master, it) }.orEmpty()
             if (masterText.startsWith("#EXTM3U")) {
@@ -102,69 +112,87 @@ class FlixCloud : ExtractorApi() {
                 this.quality = quality
             }
         )
+        Log.i(TAG, "emitted link $linkName")
     }
 
     /** Runs the whole decryption chain and returns the master m3u8 URL. */
     private suspend fun decryptMasterUrl(data: Map<String, Any?>, embedUrl: String): String? {
-        val seed = data["obfuscation_seed"] as? String ?: return null
-        val wPayload = data["w_payload"] as? String ?: return null
+        return try {
+            val seed = data["obfuscation_seed"] as? String ?: run {
+                Log.w(TAG, "missing obfuscation_seed in data object (keys=${data.keys})")
+                return null
+            }
+            val wPayload = data["w_payload"] as? String ?: return null
 
-        // dynamic field mapping (mirrors the site's ea())
-        var e = seed
-        repeat(3) { e = sha256Hex(e + it.toString()) }
-        var n = e
-        repeat(3) { n = sha256Hex(n + it.toString()) }
-        val keyField = "kf_" + e.substring(8, 16)
-        val ivField = "ivf_" + e.substring(16, 24)
-        val containerName = "cd_" + e.substring(24, 32)
-        val arrayName = "ad_" + e.substring(32, 40)
-        val objectName = "od_" + e.substring(40, 48)
-        val tokenField = e.substring(48, 64) + "_" + e.substring(56, 64)
-        val keyFrag2Field = n.substring(0, 16) + "_" + n.substring(16, 24)
+            // dynamic field mapping (mirrors the site's ea())
+            var e = seed
+            repeat(3) { e = sha256Hex(e + it.toString()) }
+            var n = e
+            repeat(3) { n = sha256Hex(n + it.toString()) }
+            val keyField = "kf_" + e.substring(8, 16)
+            val ivField = "ivf_" + e.substring(16, 24)
+            val containerName = "cd_" + e.substring(24, 32)
+            val arrayName = "ad_" + e.substring(32, 40)
+            val objectName = "od_" + e.substring(40, 48)
+            val tokenField = e.substring(48, 64) + "_" + e.substring(56, 64)
+            val keyFrag2Field = n.substring(0, 16) + "_" + n.substring(16, 24)
 
-        val ocd = data["obfuscated_crypto_data"] as? Map<*, *> ?: return null
-        val container = ocd[containerName] as? Map<*, *> ?: return null
-        val arr = container[arrayName] as? List<*> ?: return null
-        val obj0 = (arr.firstOrNull() as? Map<*, *>)?.get(objectName) as? Map<*, *> ?: return null
-        val frag1 = b64(obj0[keyField] as? String ?: return null)
-        val iv = b64(obj0[ivField] as? String ?: return null)
-        val frag2 = b64(data[keyFrag2Field] as? String ?: return null)
-        val token = data[tokenField] as? String ?: return null
+            val ocd = data["obfuscated_crypto_data"] as? Map<*, *> ?: run {
+                Log.w(TAG, "missing obfuscated_crypto_data")
+                return null
+            }
+            val container = ocd[containerName] as? Map<*, *> ?: run {
+                Log.w(TAG, "container $containerName not found (have ${ocd.keys})")
+                return null
+            }
+            val arr = container[arrayName] as? List<*> ?: return null
+            val obj0 = (arr.firstOrNull() as? Map<*, *>)?.get(objectName) as? Map<*, *> ?: return null
+            val frag1 = b64(obj0[keyField] as? String ?: run { Log.w(TAG, "keyField $keyField missing"); return null })
+            val iv = b64(obj0[ivField] as? String ?: run { Log.w(TAG, "ivField $ivField missing"); return null })
+            val frag2 = b64(data[keyFrag2Field] as? String ?: run { Log.w(TAG, "keyFrag2Field $keyFrag2Field missing"); return null })
+            val token = data[tokenField] as? String ?: run { Log.w(TAG, "tokenField $tokenField missing"); return null }
 
-        // playback token response -> ciphertext + third fragment
-        val tokenJson = app.get("$mainUrl/api/m3u8/$token", referer = embedUrl).text
-        val z = JsObjectParser.parse(tokenJson) as? Map<*, *> ?: return null
-        val ctB64 = z[sha256Hex(token + "vid").substring(0, 10)] as? String ?: return null
-        val frag3 = b64(z[sha256Hex(token + "key").substring(0, 10)] as? String ?: return null)
+            // playback token response -> ciphertext + third fragment
+            val tokenJson = app.get("$mainUrl/api/m3u8/$token", referer = embedUrl).text
+            val z = JsObjectParser.parse(tokenJson) as? Map<*, *> ?: run {
+                Log.w(TAG, "token response parse failed: ${tokenJson.take(100)}")
+                return null
+            }
+            val ctB64 = z[sha256Hex(token + "vid").substring(0, 10)] as? String ?: return null
+            val frag3 = b64(z[sha256Hex(token + "key").substring(0, 10)] as? String ?: return null)
 
-        // execute the WASM transform
-        val interp = WasmInterpreter(b64(wPayload))
-        val c = frag1.size
-        val lp = 1000; val pp = lp + c; val bp = pp + c; val cp = bp + c
-        System.arraycopy(frag1, 0, interp.memory, lp, c)
-        System.arraycopy(frag2, 0, interp.memory, pp, frag2.size)
-        System.arraycopy(frag3, 0, interp.memory, bp, frag3.size)
-        val q = seed.substring(0, 8).toLong(16).toInt()
-        interp.call("_s", intArrayOf(q))
-        interp.call("_r", intArrayOf(lp, pp, bp, cp, c))
-        val d = interp.memory.copyOfRange(cp, cp + c)
+            // execute the WASM transform
+            val interp = WasmInterpreter(b64(wPayload))
+            val c = frag1.size
+            val lp = 1000; val pp = lp + c; val bp = pp + c; val cp = bp + c
+            System.arraycopy(frag1, 0, interp.memory, lp, c)
+            System.arraycopy(frag2, 0, interp.memory, pp, frag2.size)
+            System.arraycopy(frag3, 0, interp.memory, bp, frag3.size)
+            val q = seed.substring(0, 8).toLong(16).toInt()
+            interp.call("_s", intArrayOf(q))
+            interp.call("_r", intArrayOf(lp, pp, bp, cp, c))
+            val d = interp.memory.copyOfRange(cp, cp + c)
 
-        // keep the _c() key for encrypted-tier detection
-        runCatching {
-            val pkPtr = interp.call("_c", intArrayOf())
-            wasmKey = interp.memory.copyOfRange(pkPtr, pkPtr + 32)
+            // keep the _c() key for encrypted-tier quality detection
+            runCatching {
+                val pkPtr = interp.call("_c", intArrayOf())
+                wasmKey = interp.memory.copyOfRange(pkPtr, pkPtr + 32)
+            }
+
+            // PBKDF2 -> XOR with seed -> SHA-256 => AES key
+            // (manual PBKDF2: JCE provider char->byte encodings vary across platforms)
+            val ft = pbkdf2(d, seed.toByteArray(Charsets.UTF_8), 1000, 32)
+            for (i in 0 until 32) ft[i] = (ft[i].toInt() xor seed[i % seed.length].code).toByte()
+            val aesKey = MessageDigest.getInstance("SHA-256").digest(ft)
+
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
+            val plain = String(cipher.doFinal(b64(ctB64)), Charsets.UTF_8).trim()
+            plain.takeIf { it.startsWith("http") }
+        } catch (e: Exception) {
+            Log.w(TAG, "decryptMasterUrl failed: ${e.javaClass.simpleName}: ${e.message}")
+            null
         }
-
-        // PBKDF2 -> XOR with seed -> SHA-256 => AES key
-        // (manual PBKDF2: provider char->byte encodings vary across platforms)
-        val ft = pbkdf2(d, seed.toByteArray(Charsets.UTF_8), 1000, 32)
-        for (i in 0 until 32) ft[i] = (ft[i].toInt() xor seed[i % seed.length].code).toByte()
-        val aesKey = MessageDigest.getInstance("SHA-256").digest(ft)
-
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
-        val plain = String(cipher.doFinal(b64(ctB64)), Charsets.UTF_8).trim()
-        return plain.takeIf { it.startsWith("http") }
     }
 
     private fun b64(s: String): ByteArray = base64DecodeArray(s)
@@ -233,7 +261,7 @@ class FlixCloud : ExtractorApi() {
      * parses it with a tolerant JS-object-literal parser.
      */
     private fun findDataObject(html: String): Map<String, Any?>? {
-        val regex = Regex("""data:\{""")
+        val regex = Regex("""data\s*:\s*\{""")
         for (match in regex.findAll(html)) {
             val start = match.range.last
             var depth = 0

@@ -257,6 +257,54 @@ class WasmInterpreter(wasm: ByteArray) {
                     val addr = pop() + offset
                     memory[addr] = (v and 0xFF).toByte()
                 }
+                0x28 -> { // i32.load (little-endian 4 bytes)
+                    val (_, p1) = readULeb(pc + 1)
+                    val (offset, p2) = readULeb(p1); pc = p2
+                    val addr = pop() + offset
+                    val v = (memory[addr].toInt() and 0xFF) or
+                        ((memory[addr + 1].toInt() and 0xFF) shl 8) or
+                        ((memory[addr + 2].toInt() and 0xFF) shl 16) or
+                        ((memory[addr + 3].toInt() and 0xFF) shl 24)
+                    push(v)
+                }
+                0x2E, 0x2F -> { // i32.load16_s / load16_u
+                    val signed = (bytes[pc].toInt() and 0xFF) == 0x2E
+                    val (_, p1) = readULeb(pc + 1)
+                    val (offset, p2) = readULeb(p1); pc = p2
+                    val addr = pop() + offset
+                    val low = (memory[addr].toInt() and 0xFF) or ((memory[addr + 1].toInt() and 0xFF) shl 8)
+                    push(if (signed) low.toShort().toInt() else low)
+                }
+                0x36 -> { // i32.store (little-endian 4 bytes)
+                    val (_, p1) = readULeb(pc + 1)
+                    val (offset, p2) = readULeb(p1); pc = p2
+                    val v = pop(); val addr = pop() + offset
+                    memory[addr] = (v and 0xFF).toByte()
+                    memory[addr + 1] = ((v ushr 8) and 0xFF).toByte()
+                    memory[addr + 2] = ((v ushr 16) and 0xFF).toByte()
+                    memory[addr + 3] = ((v ushr 24) and 0xFF).toByte()
+                }
+                0x37 -> { // i32.store16
+                    val (_, p1) = readULeb(pc + 1)
+                    val (offset, p2) = readULeb(p1); pc = p2
+                    val v = pop(); val addr = pop() + offset
+                    memory[addr] = (v and 0xFF).toByte()
+                    memory[addr + 1] = ((v ushr 8) and 0xFF).toByte()
+                }
+                0x1B -> { // select
+                    val c = pop(); val y = pop(); val x = pop()
+                    push(if (c != 0) x else y); pc++
+                }
+                0x67 -> { push(Integer.numberOfLeadingZeros(pop())); pc++ }
+                0x68 -> { push(Integer.numberOfTrailingZeros(pop())); pc++ }
+                0x69 -> { push(Integer.bitCount(pop())); pc++ }
+                0xC0 -> { val v = pop(); push(v shl 24 shr 24); pc++ } // i32.extend8_s
+                0xC1 -> { val v = pop(); push(v shl 16 shr 16); pc++ } // i32.extend16_s
+                0x0F -> { // return
+                    val v = if (stack.isNotEmpty()) pop() else 0
+                    return v
+                }
+                0x00 -> throw IllegalStateException("unreachable at $pc")
                 else -> throw IllegalStateException(
                     "unsupported opcode 0x${(bytes[pc].toInt() and 0xFF).toString(16)} at $pc"
                 )

@@ -1,6 +1,7 @@
 package com.dkrepo
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
@@ -186,7 +187,9 @@ class ReAnimeProvider : MainAPI() {
 
         var found = false
         try {
-            val parsed = parseJson<FlixResponse>(app.get(flixUrl).text)
+            val flixText = app.get(flixUrl).text
+            Log.i("ReAnime", "flix api $flixUrl len=${flixText.length}")
+            val parsed = parseJson<FlixResponse>(flixText)
             val seenLinks = HashSet<String>()
             val seenSubs = HashSet<String>()
             parsed.servers?.forEach { server ->
@@ -206,11 +209,12 @@ class ReAnimeProvider : MainAPI() {
                         serverLabel = server.serverName
                     )
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.w("ReAnime", "extractor failed for $link: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
+            Log.i("ReAnime", "servers tried=${parsed.servers?.size ?: 0} found=$found")
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.w("ReAnime", "loadLinks failed: ${e.javaClass.simpleName}: ${e.message}")
         }
         return found
     }
