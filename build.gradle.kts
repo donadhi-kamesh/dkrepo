@@ -32,6 +32,7 @@ subprojects {
 
     android {
         compileSdk = 34
+        namespace = "com.dkrepo.${project.name.lowercase()}"
 
         defaultConfig {
             minSdk = 21
