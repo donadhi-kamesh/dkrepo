@@ -28,14 +28,31 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.5'
+          gradle-version: '8.12'
 
       - name: Build Plugins
         run: |
-          gradle make
+          gradle make makePluginsJson
+
+      - name: Stage build output
+        run: |
+          rm -rf build/staging
+          mkdir -p build/staging
+          cp build/plugins.json build/staging/plugins.json
+          cp ReAnime/build/ReAnime.cs3 build/staging/ReAnime.cs3
+          cat > build/staging/repo.json <<EOF
+          {
+            "name": "dkrepo",
+            "description": "Cloudstream extension Repository by dkrepo",
+            "manifestVersion": 1,
+            "pluginLists": [
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/gh-pages/plugins.json"
+            ]
+          }
+          EOF
 
       - name: Deploy to gh-pages
         uses: JamesIves/github-pages-deploy-action@v4
         with:
-          folder: build
+          folder: build/staging
           branch: gh-pages

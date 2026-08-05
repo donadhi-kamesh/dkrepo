@@ -1,13 +1,11 @@
 package com.dkrepo
 
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
-import android.content.Context
 
 @CloudstreamPlugin
-class ReAnimePlugin : Plugin() {
-    override fun load(context: Context) {
-        // Register the Re:ANIME Provider
+class ReAnimePlugin : BasePlugin() {
+    override fun load() {
         registerMainAPI(ReAnimeProvider())
     }
 }

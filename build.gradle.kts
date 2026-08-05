@@ -1,5 +1,6 @@
 import com.android.build.gradle.LibraryExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 buildscript {
@@ -9,8 +10,8 @@ buildscript {
         maven("https://jitpack.io")
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.2.2")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22")
+        classpath("com.android.tools.build:gradle:8.7.3")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
     }
 }
@@ -28,6 +29,7 @@ subprojects {
 
     cloudstream {
         setRepo(providers.environmentVariable("GITHUB_REPOSITORY").getOrElse("donadhi-kamesh/dkrepo"))
+        buildBranch = "gh-pages"
     }
 
     android {
@@ -45,13 +47,12 @@ subprojects {
     }
 
     tasks.withType<KotlinCompile> {
-        kotlinOptions {
-            jvmTarget = "1.8"
-            freeCompilerArgs = freeCompilerArgs + listOf(
-                "-opt-in=kotlin.RequiresOptIn",
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_1_8)
+            freeCompilerArgs.addAll(
                 "-Xno-call-assertions",
                 "-Xno-param-assertions",
-                "-Xno-implicit-assertion-errors"
+                "-Xno-receiver-assertions"
             )
         }
     }
@@ -59,8 +60,10 @@ subprojects {
     dependencies {
         val implementation = configurations.getByName("implementation")
 
+        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+        implementation("com.github.Blatzar:NiceHttp:0.4.11")
         implementation("org.jsoup:jsoup:1.17.2")
-        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.16.1")
+        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
     }
 }
 

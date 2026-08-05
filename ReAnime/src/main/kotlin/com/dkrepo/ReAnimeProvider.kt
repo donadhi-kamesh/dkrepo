@@ -159,8 +159,8 @@ class ReAnimeProvider : MainAPI() {
                 this.plot = description
                 this.year = year
                 this.showStatus = status
-                this.genres = details.genres
-                addEpisodes(DubStatus.Subed, episodesList.distinctBy { it.episode })
+                this.tags = details.genres
+                addEpisodes(DubStatus.Subbed, episodesList.distinctBy { it.episode })
             }
         } catch (e: Exception) {
             // HTML parsing fallback
@@ -185,7 +185,7 @@ class ReAnimeProvider : MainAPI() {
             return newAnimeLoadResponse(title, url, TvType.Anime) {
                 this.posterUrl = poster
                 this.plot = plot
-                addEpisodes(DubStatus.Subed, episodesList.distinctBy { it.episode })
+                addEpisodes(DubStatus.Subbed, episodesList.distinctBy { it.episode })
             }
         }
     }
@@ -214,14 +214,10 @@ class ReAnimeProvider : MainAPI() {
             val src = fixUrl(video.attr("src"))
             if (src.isNotEmpty()) {
                 callback(
-                    ExtractorLink(
-                        this.name,
-                        this.name,
-                        src,
-                        data,
-                        getQualityFromName(video.attr("res") ?: "720p"),
-                        isM3u8 = src.contains(".m3u8")
-                    )
+                    newExtractorLink(this.name, this.name, src) {
+                        this.referer = data
+                        this.quality = getQualityFromName(video.attr("res") ?: "720p")
+                    }
                 )
                 count++
             }
@@ -232,14 +228,9 @@ class ReAnimeProvider : MainAPI() {
         m3u8Regex.findAll(watchHtml).forEach { match ->
             val streamUrl = match.value
             callback(
-                ExtractorLink(
-                    this.name,
-                    "HLS Stream",
-                    streamUrl,
-                    data,
-                    Qualities.Unknown.value,
-                    isM3u8 = true
-                )
+                newExtractorLink(this.name, "HLS Stream", streamUrl, ExtractorLinkType.M3U8) {
+                    this.referer = data
+                }
             )
             count++
         }
