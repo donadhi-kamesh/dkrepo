@@ -44,17 +44,17 @@ subprojects {
             sourceCompatibility = JavaVersion.VERSION_1_8
             targetCompatibility = JavaVersion.VERSION_1_8
         }
+    }
 
-        tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
-            kotlinOptions {
-                jvmTarget = "1.8"
-                freeCompilerArgs = freeCompilerArgs + listOf(
-                    "-opt-in=kotlin.RequiresOptIn",
-                    "-Xno-call-assertions",
-                    "-Xno-param-assertions",
-                    "-Xno-implicit-assertion-errors"
-                )
-            }
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+        kotlinOptions {
+            jvmTarget = "1.8"
+            freeCompilerArgs = freeCompilerArgs + listOf(
+                "-opt-in=kotlin.RequiresOptIn",
+                "-Xno-call-assertions",
+                "-Xno-param-assertions",
+                "-Xno-implicit-assertion-errors"
+            )
         }
     }
 
