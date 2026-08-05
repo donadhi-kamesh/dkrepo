@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://reanime.to/favicon-32x32.png",
-        "fileHash": "sha256-42bc2cd164454e8ea1a8b2694c39b99eeaacf7cf363b791ffccda1a06b8cb316",
+        "fileHash": "sha256-2c1adce4a216c7550ae37f418215537d0e8cf85cbc5d7c15e89305638e1c793d",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/donadhi-kamesh/dkrepo",
-        "fileSize": 57597,
+        "fileSize": 55218,
         "status": 2,
         "language": "en",
         "authors": [
@@ -15,7 +15,7 @@
             "OVA",
             "AnimeMovie"
         ],
-        "version": 4,
+        "version": 5,
         "internalName": "ReAnime",
         "description": "Re:ANIME extension provider for Cloudstream",
         "url": "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/ReAnime.cs3",
