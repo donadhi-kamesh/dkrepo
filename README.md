@@ -1,0 +1,40 @@
+# dkrepo - Cloudstream Extension Repository
+
+This is a custom extension repository for [Cloudstream 3](https://github.com/recloudstream/cloudstream), maintained by **dkrepo**.
+
+---
+
+## 🚀 Extensions Included
+
+### 1. **Re:ANIME** (`ReAnime`)
+- **Site**: [https://reanime.to](https://reanime.to)
+- **Content**: Anime Series, Movies & OVAs
+- **Language**: English (Sub & Dub)
+- **Features**:
+  - Home sections (Top Anime, Popular Anime, Latest Releases)
+  - Fast search integration via Re:ANIME REST API v1
+  - Full details page with metadata, cover/banner images, genres, status, and plot
+  - Automatic episode links and stream link extractors
+
+---
+
+## 📱 How to Add to Cloudstream 3
+
+1. Open **Cloudstream 3** on your Android device.
+2. Go to **Settings** ⚙️ > **Extensions**.
+3. Tap **Add Repository**.
+4. Enter the Repository URL:
+   ```text
+   https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/repo.json
+   ```
+5. Click **Add** and install **Re:ANIME** from the extensions list!
+
+---
+
+## 🛠️ Building Locally
+
+To build the plugin locally using Gradle:
+```bash
+./gradlew ReAnime:make
+```
+The output plugin `.cs3` / `.jar` file will be generated in `build/`.
