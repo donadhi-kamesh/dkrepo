@@ -16,14 +16,34 @@ class ReAnimeProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/api/v1/top/anime" to "Top Anime",
-        "$mainUrl/api/v1/search?q=a" to "Popular Anime",
-        "$mainUrl/home" to "Latest Releases"
+        "$mainUrl/api/v1/search?q=a" to "Trending Anime",
+        "$mainUrl/api/v1/schedule" to "Latest Releases"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val items = mutableListOf<SearchResponse>()
         try {
-            if (request.data.contains("/top/anime")) {
+            if (request.data.contains("/schedule")) {
+                val response = app.get(request.data).text
+                val parsed = parseJson<ScheduleApiResponse>(response)
+                parsed.schedule?.forEach { day ->
+                    day.episodes?.forEach { item ->
+                        val title = item.title?.english?.ifEmpty { null }
+                            ?: item.title?.romaji?.ifEmpty { null }
+                            ?: item.title?.native ?: "Unknown"
+                        val animeId = item.animeId ?: return@forEach
+                        val cover = item.coverImage?.extraLarge?.ifEmpty { null }
+                            ?: item.coverImage?.large?.ifEmpty { null }
+                            ?: item.coverImage?.medium ?: ""
+
+                        items.add(
+                            newAnimeSearchResponse(title, "$mainUrl/anime/$animeId", TvType.Anime) {
+                                this.posterUrl = cover
+                            }
+                        )
+                    }
+                }
+            } else if (request.data.contains("/top/anime")) {
                 val response = app.get(request.data).text
                 val parsed = parseJson<TopAnimeResponse>(response)
                 parsed.data?.forEach { item ->
@@ -60,7 +80,6 @@ class ReAnimeProvider : MainAPI() {
                     )
                 }
             } else {
-                // Home page HTML fallback
                 val doc = app.get(request.data).document
                 doc.select("a[href^=/anime/]").forEach { element ->
                     val href = element.attr("href")
@@ -123,33 +142,45 @@ class ReAnimeProvider : MainAPI() {
                 else -> ShowStatus.Ongoing
             }
 
-            val episodesList = mutableListOf<Episode>()
-            val totalEps = details.episodesTotal ?: details.lastEpisode ?: details.episodes ?: 0
+            val subEpisodes = mutableListOf<Episode>()
+            val dubEpisodes = mutableListOf<Episode>()
 
-            if (totalEps > 0) {
-                for (epNum in 1..totalEps) {
-                    episodesList.add(
-                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum") {
+            val subCount = details.subbed ?: details.episodesTotal ?: details.lastEpisode ?: details.episodes ?: 0
+            val dubCount = details.dubbed ?: 0
+
+            if (subCount > 0) {
+                for (epNum in 1..subCount) {
+                    subEpisodes.add(
+                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&lang=sub") {
                             this.name = "Episode $epNum"
                             this.episode = epNum
                         }
                     )
                 }
-            } else {
-                // Fallback: parse watch page HTML for available episode links
-                val watchUrl = "$mainUrl/watch/$animeId"
-                val watchHtml = app.get(watchUrl).text
-                val doc = Jsoup.parse(watchHtml)
-                doc.select("a[href*=/watch/$animeId?ep=]").forEach { element ->
-                    val epHref = element.attr("href")
-                    val epName = element.text().trim()
-                    val epNumber = epHref.substringAfter("ep=").toIntOrNull()
-                    episodesList.add(
-                        newEpisode(fixUrl(epHref)) {
-                            this.name = if (epName.isNotEmpty()) epName else "Episode $epNumber"
-                            this.episode = epNumber
+            }
+
+            if (dubCount > 0) {
+                for (epNum in 1..dubCount) {
+                    dubEpisodes.add(
+                        newEpisode("$mainUrl/watch/$animeId?ep=$epNum&lang=dub") {
+                            this.name = "Episode $epNum (Dub)"
+                            this.episode = epNum
                         }
                     )
+                }
+            }
+
+            val recommendationsList = details.relations?.mapNotNull { rel ->
+                val relId = rel.animeId ?: return@mapNotNull null
+                val relTitle = rel.title?.english?.ifEmpty { null }
+                    ?: rel.title?.romaji?.ifEmpty { null }
+                    ?: rel.title?.native ?: "Unknown"
+                val relCover = rel.coverImage?.extraLarge?.ifEmpty { null }
+                    ?: rel.coverImage?.large?.ifEmpty { null }
+                    ?: rel.coverImage?.medium ?: ""
+
+                newAnimeSearchResponse(relTitle, "$mainUrl/anime/$relId", TvType.Anime) {
+                    this.posterUrl = relCover
                 }
             }
 
@@ -159,11 +190,18 @@ class ReAnimeProvider : MainAPI() {
                 this.plot = description
                 this.year = year
                 this.showStatus = status
-                this.tags = details.genres
-                addEpisodes(DubStatus.Subbed, episodesList.distinctBy { it.episode })
+                this.genres = details.genres
+                if (recommendationsList != null) {
+                    this.recommendations = recommendationsList
+                }
+                if (subEpisodes.isNotEmpty()) {
+                    addEpisodes(DubStatus.Subed, subEpisodes)
+                }
+                if (dubEpisodes.isNotEmpty()) {
+                    addEpisodes(DubStatus.Dubbed, dubEpisodes)
+                }
             }
         } catch (e: Exception) {
-            // HTML parsing fallback
             val doc = app.get(url).document
             val title = doc.selectFirst("h1")?.text() ?: "Unknown"
             val plot = doc.selectFirst("div.description, p")?.text()
@@ -185,7 +223,7 @@ class ReAnimeProvider : MainAPI() {
             return newAnimeLoadResponse(title, url, TvType.Anime) {
                 this.posterUrl = poster
                 this.plot = plot
-                addEpisodes(DubStatus.Subbed, episodesList.distinctBy { it.episode })
+                addEpisodes(DubStatus.Subed, episodesList.distinctBy { it.episode })
             }
         }
     }
@@ -200,7 +238,6 @@ class ReAnimeProvider : MainAPI() {
         val doc = Jsoup.parse(watchHtml)
         var count = 0
 
-        // Extract iframe video embeds
         doc.select("iframe[src]").forEach { iframe ->
             val src = fixUrl(iframe.attr("src"))
             if (src.isNotEmpty()) {
@@ -209,36 +246,44 @@ class ReAnimeProvider : MainAPI() {
             }
         }
 
-        // Extract direct video source tags
         doc.select("video source[src], video[src]").forEach { video ->
             val src = fixUrl(video.attr("src"))
             if (src.isNotEmpty()) {
                 callback(
-                    newExtractorLink(this.name, this.name, src) {
-                        this.referer = data
-                        this.quality = getQualityFromName(video.attr("res") ?: "720p")
-                    }
+                    ExtractorLink(
+                        this.name,
+                        this.name,
+                        src,
+                        data,
+                        getQualityFromName(video.attr("res") ?: "720p"),
+                        isM3u8 = src.contains(".m3u8")
+                    )
                 )
                 count++
             }
         }
 
-        // Extract embedded HLS stream links if present in scripts
-        val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
+        val m3u8Regex = Regex("""https?://[^\s"']+\.(?:m3u8|mp4)[^\s"']*""")
         m3u8Regex.findAll(watchHtml).forEach { match ->
             val streamUrl = match.value
-            callback(
-                newExtractorLink(this.name, "HLS Stream", streamUrl, ExtractorLinkType.M3U8) {
-                    this.referer = data
-                }
-            )
-            count++
+            if (!streamUrl.contains("favicon") && !streamUrl.contains("logo") && !streamUrl.contains("banner")) {
+                callback(
+                    ExtractorLink(
+                        this.name,
+                        if (streamUrl.contains(".m3u8")) "HLS Stream" else "MP4 Video",
+                        streamUrl,
+                        data,
+                        Qualities.Unknown.value,
+                        isM3u8 = streamUrl.contains(".m3u8")
+                    )
+                )
+                count++
+            }
         }
 
         return count > 0
     }
 
-    // Jackson Data Models for Re:ANIME REST API v1
     data class TitleData(
         @JsonProperty("english") val english: String? = null,
         @JsonProperty("native") val native: String? = null,
@@ -258,12 +303,28 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("format") val format: String? = null
     )
 
+    data class RelationItem(
+        @JsonProperty("anime_id") val animeId: String? = null,
+        @JsonProperty("title") val title: TitleData? = null,
+        @JsonProperty("cover_image") val coverImage: CoverImageData? = null,
+        @JsonProperty("format") val format: String? = null,
+        @JsonProperty("relation_type") val relationType: String? = null
+    )
+
     data class SearchApiResponse(
         @JsonProperty("results") val results: List<AnimeSearchItem>? = null
     )
 
     data class TopAnimeResponse(
         @JsonProperty("data") val data: List<AnimeSearchItem>? = null
+    )
+
+    data class ScheduleDay(
+        @JsonProperty("episodes") val episodes: List<AnimeSearchItem>? = null
+    )
+
+    data class ScheduleApiResponse(
+        @JsonProperty("schedule") val schedule: List<ScheduleDay>? = null
     )
 
     data class AnimeDetailsResponse(
@@ -277,6 +338,9 @@ class ReAnimeProvider : MainAPI() {
         @JsonProperty("genres") val genres: List<String>? = null,
         @JsonProperty("episodes") val episodes: Int? = null,
         @JsonProperty("episodes_total") val episodesTotal: Int? = null,
-        @JsonProperty("last_episode") val lastEpisode: Int? = null
+        @JsonProperty("last_episode") val lastEpisode: Int? = null,
+        @JsonProperty("subbed") val subbed: Int? = null,
+        @JsonProperty("dubbed") val dubbed: Int? = null,
+        @JsonProperty("relations") val relations: List<RelationItem>? = null
     )
 }
