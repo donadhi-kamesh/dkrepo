@@ -1,10 +1,13 @@
 package com.dkrepo
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.PropertyNamingStrategies
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import java.net.URLEncoder
 
 class ReAnimeProvider : MainAPI() {
@@ -16,6 +19,22 @@ class ReAnimeProvider : MainAPI() {
 
     private val flixCloud = FlixCloud()
 
+    companion object {
+        /**
+         * We parse the reanime.to API ourselves with an explicitly configured
+         * Jackson mapper. Cloudstream's AppUtils.parseJson uses kotlinx first
+         * and its shared mapper may silently drop snake_case json keys, which
+         * made anilist_id/tmdb/etc come through as 0 (breaking the flix API).
+         */
+        private val apiMapper: ObjectMapper = jacksonObjectMapper().apply {
+            this.propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
+            this.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+        }
+
+        private fun <T : Any> parseApi(text: String, clazz: Class<T>): T =
+            apiMapper.readValue(text, clazz)
+    }
+
     override val mainPage = mainPageOf(
         "$mainUrl/api/v1/top/anime" to "Top Anime",
         "$mainUrl/api/v1/schedule" to "Latest Releases"
@@ -25,14 +44,14 @@ class ReAnimeProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         try {
             if (request.data.contains("/schedule")) {
-                val parsed = parseJson<ScheduleApiResponse>(app.get(request.data).text)
+                val parsed = parseApi(app.get(request.data).text, ScheduleApiResponse::class.java)
                 parsed.schedule?.forEach { day ->
                     day.episodes?.forEach { item ->
                         item.toSearchResponse()?.let { items.add(it) }
                     }
                 }
             } else {
-                val parsed = parseJson<TopAnimeResponse>(app.get(request.data).text)
+                val parsed = parseApi(app.get(request.data).text, TopAnimeResponse::class.java)
                 parsed.data?.forEach { item ->
                     item.toSearchResponse()?.let { items.add(it) }
                 }
@@ -45,8 +64,9 @@ class ReAnimeProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val parsed = parseJson<SearchApiResponse>(
-            app.get("$mainUrl/api/v1/search?q=$encodedQuery").text
+        val parsed = parseApi(
+            app.get("$mainUrl/api/v1/search?q=$encodedQuery").text,
+            SearchApiResponse::class.java
         )
         return parsed.results?.mapNotNull { it.toSearchResponse() } ?: emptyList()
     }
@@ -71,8 +91,9 @@ class ReAnimeProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val animeId = url.removePrefix("$mainUrl/anime/").removePrefix("$mainUrl/watch/")
             .substringBefore("?").substringBefore("/")
-        val details = parseJson<AnimeDetailsResponse>(
-            app.get("$mainUrl/api/v1/anime/$animeId").text
+        val details = parseApi(
+            app.get("$mainUrl/api/v1/anime/$animeId").text,
+            AnimeDetailsResponse::class.java
         )
 
         val title = details.title?.english?.ifEmpty { null }
@@ -98,8 +119,9 @@ class ReAnimeProvider : MainAPI() {
 
         // full episode list (single request, high limit)
         val episodes = try {
-            parseJson<EpisodesResponse>(
-                app.get("$mainUrl/api/v1/anime/$animeId/episodes?limit=5000").text
+            parseApi(
+                app.get("$mainUrl/api/v1/anime/$animeId/episodes?limit=5000").text,
+                EpisodesResponse::class.java
             ).data ?: emptyList()
         } catch (e: Exception) {
             emptyList()
@@ -189,7 +211,7 @@ class ReAnimeProvider : MainAPI() {
         try {
             val flixText = app.get(flixUrl).text
             Log.i("ReAnime", "flix api $flixUrl len=${flixText.length}")
-            val parsed = parseJson<FlixResponse>(flixText)
+            val parsed = parseApi(flixText, FlixResponse::class.java)
             val seenLinks = HashSet<String>()
             val seenSubs = HashSet<String>()
             parsed.servers?.forEach { server ->
