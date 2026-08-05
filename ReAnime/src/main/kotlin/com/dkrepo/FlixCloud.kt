@@ -90,16 +90,23 @@ class FlixCloud : ExtractorApi() {
         }
         Log.i(TAG, "decrypted master url: ${masterUrl.take(90)}")
 
-        // Best-effort quality detection. The CDN may serve the master either
-        // plain or XOR-wrapped (wrapped still gives quality via _c key unwrap),
-        // but the stream URL is always emitted so the player can try it.
         var quality = Qualities.Unknown.value
+        var targetUrl = masterUrl
         try {
-            val master = app.get(masterUrl, referer = "$mainUrl/", headers = headers).text
-            val masterText = if (master.startsWith("#EXTM3U")) master
-                else wasmKey?.let { xorUnwrap(master, it) }.orEmpty()
-            if (masterText.startsWith("#EXTM3U")) {
-                quality = parseMasterQuality(masterText)
+            val raw = app.get(masterUrl, referer = "$mainUrl/", headers = headers).text
+            val trimmed = raw.trim()
+            val unwrapped = if (trimmed.startsWith("#EXTM3U")) trimmed
+                else wasmKey?.let { xorUnwrap(trimmed, it) } ?: ""
+            val text = unwrapped.trim()
+            if (text.startsWith("#EXTM3U")) {
+                quality = parseMasterQuality(text)
+                if (!trimmed.startsWith("#EXTM3U") && text != trimmed) {
+                    // wrapped master -> pick best variant so ExoPlayer gets playable URL
+                    extractBestVariant(text, masterUrl)?.let {
+                        targetUrl = it
+                        Log.i(TAG, "wrapped master, using variant $targetUrl")
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "master probe failed: ${e.message}")
@@ -107,12 +114,12 @@ class FlixCloud : ExtractorApi() {
 
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
         callback(
-            newExtractorLink(this.name, linkName, masterUrl, ExtractorLinkType.M3U8) {
+            newExtractorLink(this.name, linkName, targetUrl, ExtractorLinkType.M3U8) {
                 this.referer = "$mainUrl/"
                 this.quality = quality
             }
         )
-        Log.i(TAG, "emitted link $linkName")
+        Log.i(TAG, "emitted link $linkName -> $targetUrl")
     }
 
     /** Runs the whole decryption chain and returns the master m3u8 URL. */
@@ -242,6 +249,40 @@ class FlixCloud : ExtractorApi() {
             in 450..699 -> Qualities.P480.value
             in 300..449 -> Qualities.P360.value
             else -> Qualities.Unknown.value
+        }
+    }
+
+    /** Picks highest RESOLUTION variant from an unwrapped master, resolving relative URLs against masterUrl. */
+    private fun extractBestVariant(masterText: String, baseUrl: String): String? {
+        val lines = masterText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        var bestUrl: String? = null
+        var bestHeight = -1
+        var bestBw = -1
+        for (i in lines.indices) {
+            val l = lines[i]
+            if (!l.startsWith("#EXT-X-STREAM-INF")) continue
+            val url = lines.getOrNull(i + 1)?.takeIf { it.isNotBlank() && !it.startsWith("#") } ?: continue
+            val h = Regex("""RESOLUTION=\d+x(\d+)""").find(l)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1
+            val bw = Regex("""BANDWIDTH=(\d+)""").find(l)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1
+            val better = when {
+                h != bestHeight -> h > bestHeight
+                bw != bestBw -> bw > bestBw
+                bestUrl == null -> true
+                else -> false
+            }
+            if (better) {
+                bestHeight = h
+                bestBw = bw
+                bestUrl = url
+            }
+        }
+        if (bestUrl == null) return null
+        // resolve relative
+        return try {
+            if (bestUrl.startsWith("http")) bestUrl
+            else java.net.URL(java.net.URL(baseUrl), bestUrl).toString()
+        } catch (e: Exception) {
+            bestUrl
         }
     }
 
