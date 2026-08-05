@@ -80,22 +80,19 @@ class FlixCloud : ExtractorApi() {
             return
         }
 
-        // Inspect the master playlist: encrypted-tier streams (fetch7) are XOR
-        // obfuscated and cannot be played by an HLS client, so skip them.
+        // Best-effort quality detection. The CDN may serve the master either
+        // plain or XOR-wrapped (wrapped still gives quality via _c key unwrap),
+        // but the stream URL is always emitted so the player can try it.
         var quality = Qualities.Unknown.value
         try {
             val master = app.get(masterUrl, referer = "$mainUrl/").text
-            if (master.startsWith("#EXTM3U")) {
-                quality = parseMasterQuality(master)
-            } else {
-                val pk = wasmKey
-                if (pk != null && looksLikePlaylist(xorUnwrap(master, pk))) {
-                    Log.i(TAG, "skipping XOR-obfuscated tier stream ($masterUrl)")
-                    return
-                }
+            val masterText = if (master.startsWith("#EXTM3U")) master
+                else wasmKey?.let { xorUnwrap(master, it) }.orEmpty()
+            if (masterText.startsWith("#EXTM3U")) {
+                quality = parseMasterQuality(masterText)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "master probe failed, emitting anyway: ${e.message}")
+            Log.w(TAG, "master probe failed: ${e.message}")
         }
 
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
@@ -219,8 +216,6 @@ class FlixCloud : ExtractorApi() {
             else -> Qualities.Unknown.value
         }
     }
-
-    private fun looksLikePlaylist(text: String): Boolean = text.trimStart().startsWith("#EXTM3U")
 
     /** fetch7 playlists are base64( XOR(plaintext, repeating 32-byte key) ). */
     private fun xorUnwrap(raw: String, key: ByteArray): String {
