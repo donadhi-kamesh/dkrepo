@@ -8,6 +8,6 @@ cloudstream {
     description = "Re:ANIME extension provider for Cloudstream"
     authors = listOf("dkrepo")
     status = 2
-    tvTypes = setOf("Anime", "OVA", "AnimeMovie")
+    tvTypes = listOf("Anime", "OVA", "AnimeMovie")
     iconUrl = "https://reanime.to/favicon-32x32.png"
 }
