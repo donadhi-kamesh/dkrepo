@@ -2,6 +2,8 @@
 
 This is a custom extension repository for [Cloudstream 3](https://github.com/recloudstream/cloudstream), maintained by **dkrepo**.
 
+![Build Status](https://github.com/donadhi-kamesh/dkrepo/actions/workflows/build_plugins.yml/badge.svg)
+
 ---
 
 ## 🚀 Extensions Included
