@@ -57,10 +57,8 @@ subprojects {
     }
 
     dependencies {
-        val cloudstream = configurations.getByName("cloudstream")
         val implementation = configurations.getByName("implementation")
 
-        cloudstream("com.github.recloudstream:cloudstream:pre-release")
         implementation("org.jsoup:jsoup:1.17.2")
         implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.16.1")
     }
