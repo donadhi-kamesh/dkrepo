@@ -2,6 +2,7 @@ package com.dkrepo
 
 import android.util.Base64
 import com.lagradost.api.Log
+import com.lagradost.cloudstream3.app
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
@@ -9,10 +10,8 @@ import java.net.Socket
 import java.net.URLDecoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import kotlinx.coroutines.runBlocking
 
 /**
  * Localhost HTTP server that serves unwrapped m3u8 playlists and proxies
@@ -29,7 +28,6 @@ object LocalPlaylistServer {
     data class Session(
         val headers: Map<String, String>,
         val xorKey: ByteArray?,
-        /** Prefer media-playlist URL as Referer for vault CDN fetches. */
         val segmentReferer: String?
     )
 
@@ -38,15 +36,6 @@ object LocalPlaylistServer {
 
     @Volatile
     private var server: ServerSocket? = null
-
-    private val http by lazy {
-        OkHttpClient.Builder()
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS)
-            .build()
-    }
 
     @Synchronized
     fun ensureStarted(): Int {
@@ -199,6 +188,8 @@ object LocalPlaylistServer {
                         "head=${cleaned.take(8).joinToString("") { "%02x".format(it) }} " +
                         "token=${remote.contains("token=")} url=${remote.take(100)}"
                 )
+            } else {
+                Log.i(TAG, "segment ok len=${cleaned.size} from ${remote.substringBefore('?').take(80)}")
             }
             writeResponse(out, 200, "video/mp2t", cleaned)
         } catch (e: Exception) {
@@ -207,40 +198,54 @@ object LocalPlaylistServer {
         }
     }
 
-    /** OkHttp (not HttpURLConnection) — try media-playlist Referer first, then flixcloud. */
+    /**
+     * Fetch via Cloudstream's shared NiceHttp client (same stack that unwraps
+     * playlists). Bare OkHttp/HttpURLConnection get vault/CDN 403s.
+     */
     private fun fetchBytes(url: String, session: Session): ByteArray? {
-        val headers = session.headers
         val referers = listOfNotNull(
             session.segmentReferer,
-            headers["Referer"],
-            "https://flixcloud.cc/"
+            "https://flixcloud.cc/",
+            session.headers["Referer"]
         ).distinct()
+        // No Origin — some CDNs 403 on non-browser Origin from OkHttp stacks
+        val baseHeaders = mapOf(
+            "User-Agent" to (session.headers["User-Agent"] ?: "Mozilla/5.0"),
+            "Accept" to "*/*"
+        )
 
         for (ref in referers) {
             try {
-                val req = Request.Builder().url(url).apply {
-                    header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-                    header("Accept", "*/*")
-                    header("Referer", ref)
-                    headers["Origin"]?.let { header("Origin", it) }
-                }.build()
-                http.newCall(req).execute().use { res ->
-                    if (!res.isSuccessful) {
-                        Log.w(
-                            TAG,
-                            "upstream HTTP ${res.code} ref=${ref.take(60)} " +
-                                "token=${url.contains("token=")} url=${url.take(100)}"
-                        )
-                        return@use
-                    }
-                    val bytes = res.body?.bytes()
-                    if (bytes != null && bytes.isNotEmpty()) return bytes
+                val res = runBlocking {
+                    app.get(
+                        url,
+                        referer = ref,
+                        headers = baseHeaders,
+                        timeout = 60
+                    )
+                }
+                if (!res.isSuccessful) {
+                    Log.w(
+                        TAG,
+                        "upstream HTTP ${res.code} ref=${ref.take(70)} " +
+                            "token=${url.contains("token=")} url=${url.take(110)}"
+                    )
+                    continue
+                }
+                val bytes = res.body.bytes()
+                if (bytes.isNotEmpty()) {
+                    Log.i(
+                        TAG,
+                        "fetched ${bytes.size}b head=${bytes.take(4).joinToString("") { "%02x".format(it) }} " +
+                            "url=${url.substringBefore('?').take(80)}"
+                    )
+                    return bytes
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "fetch failed ref=${ref.take(60)}: ${e.message}")
+                Log.w(TAG, "fetch failed ref=${ref.take(70)}: ${e.message}")
             }
         }
-        Log.w(TAG, "segment fetch failed: token=${url.contains("token=")} ${url.take(100)}")
+        Log.w(TAG, "segment fetch failed: token=${url.contains("token=")} ${url.take(110)}")
         return null
     }
 
@@ -254,6 +259,9 @@ object LocalPlaylistServer {
             val stripped = stripImageContainer(xored)
             if (looksLikeTs(stripped) || looksLikeFmp4(stripped)) return stripped
             if (looksLikeTs(xored) || looksLikeFmp4(xored)) return xored
+            findTsStart(xored)?.let { start ->
+                if (start > 0) return xored.copyOfRange(start, xored.size)
+            }
         }
         findTsStart(data)?.let { start ->
             if (start > 0) return data.copyOfRange(start, data.size)
@@ -263,6 +271,7 @@ object LocalPlaylistServer {
 
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
+        // PNG
         if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
             data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
         ) {
@@ -278,9 +287,16 @@ object LocalPlaylistServer {
                 if (start < data.size) return data.copyOfRange(start, data.size)
             }
         }
+        // RIFF / WEBP — skip full RIFF chunk then scan for TS
         if (data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
             data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
         ) {
+            val riffSize = (data[4].toInt() and 0xff) or
+                ((data[5].toInt() and 0xff) shl 8) or
+                ((data[6].toInt() and 0xff) shl 16) or
+                ((data[7].toInt() and 0xff) shl 24)
+            val after = (8 + riffSize).coerceAtMost(data.size)
+            findTsStart(data, after)?.let { return data.copyOfRange(it, data.size) }
             findTsStart(data, 12)?.let { return data.copyOfRange(it, data.size) }
         }
         return data
@@ -298,7 +314,7 @@ object LocalPlaylistServer {
     }
 
     private fun findTsStart(data: ByteArray, from: Int = 0): Int? {
-        var i = from
+        var i = from.coerceAtLeast(0)
         while (i + 188 < data.size) {
             if (data[i] == 0x47.toByte() &&
                 (i + 188 >= data.size || data[i + 188] == 0x47.toByte())

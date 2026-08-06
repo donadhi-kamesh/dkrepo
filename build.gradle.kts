@@ -63,6 +63,7 @@ subprojects {
         compileOnly("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
         compileOnly("com.github.Blatzar:NiceHttp:0.4.11")
         compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
+        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
         compileOnly("org.jsoup:jsoup:1.17.2")
         compileOnly("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
     }

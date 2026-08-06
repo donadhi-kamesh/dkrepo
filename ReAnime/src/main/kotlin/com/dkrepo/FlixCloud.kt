@@ -126,7 +126,8 @@ class FlixCloud : ExtractorApi() {
         }
         Log.i(
             TAG,
-            "first segment=${firstSegment.take(90)} tokenPresent=${firstSegment.contains("token=")}"
+            "first segment=${firstSegment.take(120)} tokenPresent=${firstSegment.contains("token=")} " +
+                "host=${runCatching { java.net.URL(firstSegment).host }.getOrNull()}"
         )
 
         // Serve unwrapped playlist from localhost and proxy segments:
@@ -168,8 +169,11 @@ class FlixCloud : ExtractorApi() {
     }
 
     /**
-     * Resolve relative against base, then re-attach base JWT query.
-     * Absolute CDN segment URLs (vault-*.rundowncdn.top) also need the token.
+     * Resolve relative against base, remap vault CDNs onto the signed fetch host,
+     * then re-attach JWT only when the final host matches the media playlist host.
+     *
+     * Vault hosts (slopnet/rundowncdn) reject the fetch-host JWT with HTTP 403;
+     * the same path on fetch*.flixcloud.cc accepts it.
      */
     private fun resolveUrl(baseUrl: String, relative: String): String {
         val resolved = when {
@@ -181,7 +185,36 @@ class FlixCloud : ExtractorApi() {
                 relative
             }
         }
-        return ensureQuery(resolved, queryOf(baseUrl))
+        if (resolved.startsWith("data:")) return resolved
+        val remapped = remapToFetchHost(resolved, baseUrl)
+        return try {
+            val mediaHost = java.net.URL(baseUrl).host
+            val finalHost = java.net.URL(remapped).host
+            if (mediaHost.equals(finalHost, ignoreCase = true)) {
+                ensureQuery(remapped, queryOf(baseUrl))
+            } else {
+                // Foreign host: do not attach fetch JWT (causes vault 403)
+                remapped
+            }
+        } catch (_: Exception) {
+            ensureQuery(remapped, queryOf(baseUrl))
+        }
+    }
+
+    /** Move vault-*.slopnet / rundowncdn segment URLs onto fetch*.flixcloud.cc. */
+    private fun remapToFetchHost(url: String, mediaUrl: String): String {
+        return try {
+            val media = java.net.URL(mediaUrl)
+            val u = java.net.URL(url)
+            if (u.host.equals(media.host, ignoreCase = true)) return url
+            val h = u.host.lowercase()
+            val vaultLike = h.contains("vault") || h.contains("slopnet") ||
+                h.contains("rundowncdn") || (h.contains("cdn") && !h.contains("flixcloud"))
+            if (!vaultLike) return url
+            java.net.URL(media.protocol, media.host, u.file).toString()
+        } catch (_: Exception) {
+            url
+        }
     }
 
     private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
