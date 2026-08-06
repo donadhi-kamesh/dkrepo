@@ -1,34 +1,36 @@
 package com.dkrepo
 
+import android.util.Base64
 import com.lagradost.api.Log
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.HttpURLConnection
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URL
+import java.net.URLDecoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 /**
  * Localhost HTTP server that serves unwrapped m3u8 playlists and proxies
- * segment/key fetches so we can:
- *  - re-apply FlixCloud headers (Referer/Origin/UA)
- *  - strip PNG/WebP disguises and optional XOR wrapping to real MPEG-TS
+ * segment/key fetches so we can strip PNG/WebP/XOR disguises to real MPEG-TS.
  *
- * Needed because Cronet rejects `data:` URIs and Cloudstream drops blank
- * ExtractorLinkPlayList urls.
+ * Segment remote URLs are embedded (base64) in the request so we never lose
+ * mappings when many HD-1/HD-2 playlists are published at once.
  */
 object LocalPlaylistServer {
     private const val TAG = "FlixCloudLocal"
     private val playlists = ConcurrentHashMap<String, ByteArray>()
-    private val segments = ConcurrentHashMap<String, ProxiedResource>()
+    private val sessions = ConcurrentHashMap<String, Session>()
 
-    data class ProxiedResource(
-        val remoteUrl: String,
+    data class Session(
         val headers: Map<String, String>,
-        val xorKey: ByteArray?
+        val xorKey: ByteArray?,
+        /** Prefer media-playlist URL as Referer for vault CDN fetches. */
+        val segmentReferer: String?
     )
 
     @Volatile
@@ -36,6 +38,15 @@ object LocalPlaylistServer {
 
     @Volatile
     private var server: ServerSocket? = null
+
+    private val http by lazy {
+        OkHttpClient.Builder()
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .build()
+    }
 
     @Synchronized
     fun ensureStarted(): Int {
@@ -59,29 +70,23 @@ object LocalPlaylistServer {
         return port
     }
 
-    /**
-     * Rewrite remote segment/key URIs to localhost proxy paths, store the
-     * playlist, and return a localhost m3u8 URL.
-     */
     fun publish(
         body: String,
         headers: Map<String, String>,
-        xorKey: ByteArray? = null
+        xorKey: ByteArray? = null,
+        segmentReferer: String? = null
     ): String {
         val p = ensureStarted()
-        val rewritten = rewritePlaylist(body, headers, xorKey, p)
+        val sessionId = UUID.randomUUID().toString().replace("-", "")
+        sessions[sessionId] = Session(headers, xorKey, segmentReferer)
+        val rewritten = rewritePlaylist(body, sessionId, p)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
         trimMaps()
         return "http://127.0.0.1:$p/$id.m3u8"
     }
 
-    private fun rewritePlaylist(
-        body: String,
-        headers: Map<String, String>,
-        xorKey: ByteArray?,
-        p: Int
-    ): String {
+    private fun rewritePlaylist(body: String, sessionId: String, p: Int): String {
         val uriTagRegex = Regex("""URI=["']([^"']+)["']""")
         return body.lines().joinToString("\n") { line ->
             val t = line.trim()
@@ -91,28 +96,25 @@ object LocalPlaylistServer {
                     uriTagRegex.replace(line) { match ->
                         val uri = match.groupValues[1]
                         if (uri.startsWith("http://") || uri.startsWith("https://")) {
-                            """URI="${proxyUrl(uri, headers, xorKey, p)}""""
+                            """URI="${proxyUrl(sessionId, uri, p)}""""
                         } else {
                             match.value
                         }
                     }
                 }
                 t.startsWith("http://") || t.startsWith("https://") ->
-                    proxyUrl(t, headers, xorKey, p)
+                    proxyUrl(sessionId, t, p)
                 else -> line
             }
         }
     }
 
-    private fun proxyUrl(
-        remote: String,
-        headers: Map<String, String>,
-        xorKey: ByteArray?,
-        p: Int
-    ): String {
-        val id = UUID.randomUUID().toString().replace("-", "")
-        segments[id] = ProxiedResource(remote, headers, xorKey)
-        return "http://127.0.0.1:$p/s/$id"
+    private fun proxyUrl(sessionId: String, remote: String, p: Int): String {
+        val enc = Base64.encodeToString(
+            remote.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+        )
+        return "http://127.0.0.1:$p/s/$sessionId?u=$enc"
     }
 
     private fun trimMaps() {
@@ -120,9 +122,9 @@ object LocalPlaylistServer {
             val keys = playlists.keys().toList()
             keys.take(keys.size - 24).forEach { playlists.remove(it) }
         }
-        if (segments.size > 512) {
-            val keys = segments.keys().toList()
-            keys.take(keys.size - 384).forEach { segments.remove(it) }
+        if (sessions.size > 32) {
+            val keys = sessions.keys().toList()
+            keys.take(keys.size - 24).forEach { sessions.remove(it) }
         }
     }
 
@@ -135,15 +137,15 @@ object LocalPlaylistServer {
                     val line = input.readLine() ?: break
                     if (line.isEmpty()) break
                 }
-                val path = requestLine.split(' ').getOrNull(1)
-                    ?.substringBefore('?')
-                    ?.trimStart('/')
-                    ?: ""
+                val target = requestLine.split(' ').getOrNull(1) ?: ""
+                val path = target.substringBefore('?').trimStart('/')
+                val query = target.substringAfter('?', "")
                 val out = s.getOutputStream()
                 when {
                     path.startsWith("s/") -> {
-                        val id = path.removePrefix("s/")
-                        serveSegment(id, out)
+                        val sessionId = path.removePrefix("s/").substringBefore('/')
+                        val enc = queryOf(query, "u")
+                        serveSegment(sessionId, enc, out)
                     }
                     else -> {
                         val id = path.removeSuffix(".m3u8")
@@ -161,26 +163,41 @@ object LocalPlaylistServer {
         }
     }
 
-    private fun serveSegment(id: String, out: java.io.OutputStream) {
-        val res = segments[id]
-        if (res == null) {
+    private fun queryOf(query: String, key: String): String? {
+        if (query.isEmpty()) return null
+        return query.split('&').firstOrNull { it.startsWith("$key=") }
+            ?.substringAfter('=')
+            ?.let { URLDecoder.decode(it, "UTF-8") }
+    }
+
+    private fun serveSegment(sessionId: String, enc: String?, out: java.io.OutputStream) {
+        val session = sessions[sessionId]
+        if (session == null || enc.isNullOrBlank()) {
             writeResponse(out, 404, "text/plain", ByteArray(0))
             return
         }
+        val remote = try {
+            String(
+                Base64.decode(enc, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING),
+                Charsets.UTF_8
+            )
+        } catch (e: Exception) {
+            writeResponse(out, 400, "text/plain", ByteArray(0))
+            return
+        }
         try {
-            val raw = fetchBytes(res.remoteUrl, res.headers)
+            val raw = fetchBytes(remote, session)
             if (raw == null) {
-                Log.w(TAG, "segment fetch failed: ${res.remoteUrl.take(90)}")
                 writeResponse(out, 502, "text/plain", ByteArray(0))
                 return
             }
-            val cleaned = normalizeSegment(raw, res.xorKey)
+            val cleaned = normalizeSegment(raw, session.xorKey)
             if (!looksLikeTs(cleaned) && !looksLikeFmp4(cleaned)) {
                 Log.w(
                     TAG,
-                    "segment still not media after normalize " +
-                        "len=${cleaned.size} head=${cleaned.take(8).joinToString("") { "%02x".format(it) }} " +
-                        "url=${res.remoteUrl.take(90)}"
+                    "segment still not media after normalize len=${cleaned.size} " +
+                        "head=${cleaned.take(8).joinToString("") { "%02x".format(it) }} " +
+                        "token=${remote.contains("token=")} url=${remote.take(100)}"
                 )
             }
             writeResponse(out, 200, "video/mp2t", cleaned)
@@ -190,34 +207,43 @@ object LocalPlaylistServer {
         }
     }
 
-    private fun fetchBytes(url: String, headers: Map<String, String>): ByteArray? {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = true
-            connectTimeout = 20_000
-            readTimeout = 30_000
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
-            headers["Referer"]?.let { setRequestProperty("Referer", it) }
-            headers["Origin"]?.let { setRequestProperty("Origin", it) }
-            // Avoid inheriting image Accept that some CDNs key off of
-            setRequestProperty("Accept", "*/*")
-        }
-        return try {
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val bytes = stream?.use { it.readBytes() }
-            if (code !in 200..299) {
-                Log.w(TAG, "upstream HTTP $code for ${url.take(90)}")
-                null
-            } else {
-                bytes
+    /** OkHttp (not HttpURLConnection) — try media-playlist Referer first, then flixcloud. */
+    private fun fetchBytes(url: String, session: Session): ByteArray? {
+        val headers = session.headers
+        val referers = listOfNotNull(
+            session.segmentReferer,
+            headers["Referer"],
+            "https://flixcloud.cc/"
+        ).distinct()
+
+        for (ref in referers) {
+            try {
+                val req = Request.Builder().url(url).apply {
+                    header("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0")
+                    header("Accept", "*/*")
+                    header("Referer", ref)
+                    headers["Origin"]?.let { header("Origin", it) }
+                }.build()
+                http.newCall(req).execute().use { res ->
+                    if (!res.isSuccessful) {
+                        Log.w(
+                            TAG,
+                            "upstream HTTP ${res.code} ref=${ref.take(60)} " +
+                                "token=${url.contains("token=")} url=${url.take(100)}"
+                        )
+                        return@use
+                    }
+                    val bytes = res.body?.bytes()
+                    if (bytes != null && bytes.isNotEmpty()) return bytes
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "fetch failed ref=${ref.take(60)}: ${e.message}")
             }
-        } finally {
-            conn.disconnect()
         }
+        Log.w(TAG, "segment fetch failed: token=${url.contains("token=")} ${url.take(100)}")
+        return null
     }
 
-    /** Strip image disguise / XOR wrap so ExoPlayer sees MPEG-TS or fMP4. */
     private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray {
         var data = stripImageContainer(raw)
         if (looksLikeTs(data) || looksLikeFmp4(data)) return data
@@ -226,16 +252,9 @@ object LocalPlaylistServer {
                 (data[i].toInt() xor xorKey[i % xorKey.size].toInt()).toByte()
             }
             val stripped = stripImageContainer(xored)
-            if (looksLikeTs(stripped) || looksLikeFmp4(stripped) ||
-                looksLikeTs(xored) || looksLikeFmp4(xored)
-            ) {
-                return when {
-                    looksLikeTs(stripped) || looksLikeFmp4(stripped) -> stripped
-                    else -> xored
-                }
-            }
+            if (looksLikeTs(stripped) || looksLikeFmp4(stripped)) return stripped
+            if (looksLikeTs(xored) || looksLikeFmp4(xored)) return xored
         }
-        // Last resort: scan for TS sync even if header junk remains
         findTsStart(data)?.let { start ->
             if (start > 0) return data.copyOfRange(start, data.size)
         }
@@ -244,21 +263,21 @@ object LocalPlaylistServer {
 
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
-        // PNG
         if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
             data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
         ) {
             val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
             if (iend >= 0) {
-                var start = iend + 8 // IEND + CRC
-                while (start < data.size && (data[start] == 0xFF.toByte() || data[start] == 0x00.toByte())) {
+                var start = iend + 8
+                while (start < data.size &&
+                    (data[start] == 0xFF.toByte() || data[start] == 0x00.toByte())
+                ) {
                     start++
                 }
                 findTsStart(data, start)?.let { return data.copyOfRange(it, data.size) }
                 if (start < data.size) return data.copyOfRange(start, data.size)
             }
         }
-        // RIFF/WEBP
         if (data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
             data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
         ) {
@@ -274,7 +293,6 @@ object LocalPlaylistServer {
 
     private fun looksLikeFmp4(data: ByteArray): Boolean {
         if (data.size < 8) return false
-        // ....ftyp or ....moof / ....mdat
         val box = String(data, 4, minOf(4, data.size - 4), Charsets.US_ASCII)
         return box == "ftyp" || box == "moof" || box == "mdat" || box == "styp"
     }
@@ -310,6 +328,7 @@ object LocalPlaylistServer {
     ) {
         val status = when (code) {
             200 -> "200 OK"
+            400 -> "400 Bad Request"
             404 -> "404 Not Found"
             502 -> "502 Bad Gateway"
             else -> "$code"

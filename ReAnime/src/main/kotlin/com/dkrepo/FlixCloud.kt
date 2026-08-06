@@ -139,7 +139,12 @@ class FlixCloud : ExtractorApi() {
             "Origin" to mainUrl,
             "Referer" to "$mainUrl/"
         )
-        val playUrl = LocalPlaylistServer.publish(absolutized, playHeaders, wasmKey)
+        val playUrl = LocalPlaylistServer.publish(
+            absolutized,
+            playHeaders,
+            wasmKey,
+            segmentReferer = mediaUrl
+        )
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
         callback(
             newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
