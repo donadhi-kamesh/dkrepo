@@ -7,15 +7,14 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64DecodeArray
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkPlayList
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.PlayListItem
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-
-import android.util.Base64
 
 /**
  * Extractor for flixcloud.cc embeds (the player reanime.to uses).
@@ -119,33 +118,60 @@ class FlixCloud : ExtractorApi() {
         }
 
         val absolutized = absolutizePlaylist(mediaText, mediaUrl)
-        val firstSegment = absolutized.lines()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+        val playlistItems = parseMediaPlaylistItems(absolutized)
+        if (playlistItems.isEmpty()) {
+            Log.w(TAG, "no playable segments found in media playlist")
+            return
+        }
+        val firstSegment = playlistItems.first().url
         Log.i(
             TAG,
-            "first segment=${firstSegment?.take(90)} tokenPresent=${firstSegment?.contains("token=") == true}"
+            "segments=${playlistItems.size} first=${firstSegment.take(90)} tokenPresent=${firstSegment.contains("token=")}"
         )
 
-        val b64 = Base64.encodeToString(
-            absolutized.toByteArray(Charsets.UTF_8),
-            Base64.NO_WRAP
-        )
-        val playUrl = "data:application/vnd.apple.mpegurl;base64,$b64"
-
+        // Cronet rejects data: URIs (ERR_UNKNOWN_URL_SCHEME → Remote error).
+        // Emit HTTPS segment list so ExoPlayer fetches real CDN URLs instead.
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
-        callback(
-            newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
-                this.referer = "$mainUrl/"
-                this.quality = quality
-                this.headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/"
-                )
-            }
+        val playHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/"
         )
-        Log.i(TAG, "emitted link $linkName -> data URI length ${playUrl.length}")
+        @Suppress("DEPRECATION")
+        callback(
+            ExtractorLinkPlayList(
+                source = this.name,
+                name = linkName,
+                playlist = playlistItems,
+                referer = "$mainUrl/",
+                quality = quality,
+                headers = playHeaders,
+                type = ExtractorLinkType.VIDEO,
+            )
+        )
+        Log.i(TAG, "emitted playlist link $linkName with ${playlistItems.size} segments")
+    }
+
+    /** Parse #EXTINF + URI lines into ConcatenatingMediaSource playlist items. */
+    private fun parseMediaPlaylistItems(mediaText: String): List<PlayListItem> {
+        val items = ArrayList<PlayListItem>()
+        val lines = mediaText.lines().map { it.trim() }
+        var pendingDurationSec: Double? = null
+        for (line in lines) {
+            when {
+                line.startsWith("#EXTINF:") -> {
+                    val raw = line.removePrefix("#EXTINF:").substringBefore(',').trim()
+                    pendingDurationSec = raw.toDoubleOrNull()
+                }
+                line.isNotEmpty() && !line.startsWith("#") -> {
+                    val durationSec = pendingDurationSec ?: 6.0
+                    pendingDurationSec = null
+                    val micros = (durationSec * 1_000_000.0).toLong().coerceAtLeast(1_000_000L)
+                    items.add(PlayListItem(url = line, durationUs = micros))
+                }
+            }
+        }
+        return items
     }
 
     private fun queryOf(url: String): String? =
