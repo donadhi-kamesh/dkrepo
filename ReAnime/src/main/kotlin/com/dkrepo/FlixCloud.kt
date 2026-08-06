@@ -7,10 +7,9 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.base64DecodeArray
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkPlayList
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.PlayListItem
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -118,60 +117,35 @@ class FlixCloud : ExtractorApi() {
         }
 
         val absolutized = absolutizePlaylist(mediaText, mediaUrl)
-        val playlistItems = parseMediaPlaylistItems(absolutized)
-        if (playlistItems.isEmpty()) {
+        val firstSegment = absolutized.lines()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+        if (firstSegment == null) {
             Log.w(TAG, "no playable segments found in media playlist")
             return
         }
-        val firstSegment = playlistItems.first().url
         Log.i(
             TAG,
-            "segments=${playlistItems.size} first=${firstSegment.take(90)} tokenPresent=${firstSegment.contains("token=")}"
+            "first segment=${firstSegment.take(90)} tokenPresent=${firstSegment.contains("token=")}"
         )
 
-        // Cronet rejects data: URIs (ERR_UNKNOWN_URL_SCHEME → Remote error).
-        // Emit HTTPS segment list so ExoPlayer fetches real CDN URLs instead.
+        // Serve unwrapped playlist from localhost:
+        // - data: URIs → Cronet ERR_UNKNOWN_URL_SCHEME
+        // - ExtractorLinkPlayList → RepoLinkGenerator drops blank url
+        val playUrl = LocalPlaylistServer.publish(absolutized)
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
-        val playHeaders = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Origin" to mainUrl,
-            "Referer" to "$mainUrl/"
-        )
-        @Suppress("DEPRECATION")
         callback(
-            ExtractorLinkPlayList(
-                source = this.name,
-                name = linkName,
-                playlist = playlistItems,
-                referer = "$mainUrl/",
-                quality = quality,
-                headers = playHeaders,
-                type = ExtractorLinkType.VIDEO,
-            )
-        )
-        Log.i(TAG, "emitted playlist link $linkName with ${playlistItems.size} segments")
-    }
-
-    /** Parse #EXTINF + URI lines into ConcatenatingMediaSource playlist items. */
-    private fun parseMediaPlaylistItems(mediaText: String): List<PlayListItem> {
-        val items = ArrayList<PlayListItem>()
-        val lines = mediaText.lines().map { it.trim() }
-        var pendingDurationSec: Double? = null
-        for (line in lines) {
-            when {
-                line.startsWith("#EXTINF:") -> {
-                    val raw = line.removePrefix("#EXTINF:").substringBefore(',').trim()
-                    pendingDurationSec = raw.toDoubleOrNull()
-                }
-                line.isNotEmpty() && !line.startsWith("#") -> {
-                    val durationSec = pendingDurationSec ?: 6.0
-                    pendingDurationSec = null
-                    val micros = (durationSec * 1_000_000.0).toLong().coerceAtLeast(1_000_000L)
-                    items.add(PlayListItem(url = line, durationUs = micros))
-                }
+            newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
+                this.referer = "$mainUrl/"
+                this.quality = quality
+                this.headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Origin" to mainUrl,
+                    "Referer" to "$mainUrl/"
+                )
             }
-        }
-        return items
+        )
+        Log.i(TAG, "emitted link $linkName -> $playUrl")
     }
 
     private fun queryOf(url: String): String? =
@@ -193,26 +167,36 @@ class FlixCloud : ExtractorApi() {
     }
 
     private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
-        return try {
-            val headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Origin" to mainUrl
-            )
-            val raw = app.get(url, referer = "$mainUrl/", headers = headers).text.trim()
-            if (raw.startsWith("#EXTM3U")) return raw
+        val headers = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Origin" to mainUrl
+        )
+        var lastError: String? = null
+        repeat(3) { attempt ->
+            try {
+                val raw = app.get(
+                    url,
+                    referer = "$mainUrl/",
+                    headers = headers,
+                    timeout = 60
+                ).text.trim()
+                if (raw.startsWith("#EXTM3U")) return raw
 
-            val key = wasmKey
-            if (key != null) {
-                val result = xorUnwrap(raw, key).trim()
-                if (result.startsWith("#EXTM3U")) return result
+                val key = wasmKey
+                if (key != null) {
+                    val result = xorUnwrap(raw, key).trim()
+                    if (result.startsWith("#EXTM3U")) return result
+                }
+
+                lastError = "response body is not valid M3U8"
+                Log.w(TAG, "fetchAndUnwrapPlaylist: $lastError for $url (attempt ${attempt + 1})")
+            } catch (e: Exception) {
+                lastError = e.message
+                Log.w(TAG, "fetchAndUnwrapPlaylist failed for $url (attempt ${attempt + 1}): ${e.message}")
             }
-
-            Log.w(TAG, "fetchAndUnwrapPlaylist: response body is not valid M3U8 for $url")
-            null
-        } catch (e: Exception) {
-            Log.w(TAG, "fetchAndUnwrapPlaylist failed for $url: ${e.message}")
-            null
         }
+        Log.w(TAG, "fetchAndUnwrapPlaylist giving up for $url: $lastError")
+        return null
     }
 
     /** Runs the whole decryption chain and returns the master m3u8 URL. */
