@@ -31,6 +31,12 @@ This is a custom extension repository for [Cloudstream 3](https://github.com/rec
    ```
 5. Click **Add** and install **Re:ANIME** from the extensions list!
 
+If Cloudstream still shows an old version (e.g. v12) or download fails:
+1. Remove the **dkrepo** repository from Extensions.
+2. Force-stop Cloudstream (or clear the app cache).
+3. Re-add the repository URL above (use the `raw.githubusercontent.com` URL, not jsDelivr).
+4. Install/update **ReAnime** again — current release is on the `gh-pages` branch.
+
 ---
 
 ## 🛠️ Building Locally

@@ -40,13 +40,36 @@ jobs:
           mkdir -p build/staging
           cp build/plugins.json build/staging/plugins.json
           cp ReAnime/build/ReAnime.cs3 build/staging/ReAnime.cs3
+          # Cache-bust plugin download URLs so Cloudstream/CDNs cannot serve a stale .cs3
+          # against a newer plugins.json (common cause of "download failed" / fileHash errors).
+          python3 - <<'PY'
+          import json, re
+          path = "build/staging/plugins.json"
+          with open(path, encoding="utf-8") as f:
+              plugins = json.load(f)
+          for p in plugins:
+              ver = p.get("version")
+              url = p.get("url") or ""
+              if ver is None or not url:
+                  continue
+              base = url.split("?", 1)[0]
+              p["url"] = f"{base}?v={ver}"
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(plugins, f, indent=4)
+              f.write("\n")
+          print("Updated plugin URLs:")
+          for p in plugins:
+              print(p.get("internalName"), p.get("version"), p.get("url"))
+          PY
+          # Bust plugins.json itself for repo clients that cache the list URL
+          PLUGIN_LIST_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages/plugins.json?t=${GITHUB_RUN_ID}"
           cat > build/staging/repo.json <<EOF
           {
             "name": "dkrepo",
             "description": "Cloudstream extension Repository by dkrepo",
             "manifestVersion": 1,
             "pluginLists": [
-              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/gh-pages/plugins.json"
+              "${PLUGIN_LIST_URL}"
             ]
           }
           EOF
