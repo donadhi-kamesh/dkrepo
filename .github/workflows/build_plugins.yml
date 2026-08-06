@@ -39,7 +39,6 @@ jobs:
           rm -rf build/staging
           mkdir -p build/staging
           cp build/plugins.json build/staging/plugins.json
-          sed -i "s|https://raw.githubusercontent.com/$GITHUB_REPOSITORY/gh-pages/|https://cdn.jsdelivr.net/gh/$GITHUB_REPOSITORY@gh-pages/|g" build/staging/plugins.json
           cp ReAnime/build/ReAnime.cs3 build/staging/ReAnime.cs3
           cat > build/staging/repo.json <<EOF
           {
@@ -47,7 +46,7 @@ jobs:
             "description": "Cloudstream extension Repository by dkrepo",
             "manifestVersion": 1,
             "pluginLists": [
-              "https://cdn.jsdelivr.net/gh/$GITHUB_REPOSITORY@gh-pages/plugins.json"
+              "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/gh-pages/plugins.json"
             ]
           }
           EOF
