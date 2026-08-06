@@ -144,8 +144,12 @@ class FlixCloud : ExtractorApi() {
             absolutized,
             playHeaders,
             wasmKey,
-            segmentReferer = mediaUrl
+            segmentReferer = mediaUrl,
+            allowOpaque = mediaText.contains("#EXT-X-KEY")
         )
+        if (mediaText.contains("#EXT-X-KEY")) {
+            Log.i(TAG, "playlist declares #EXT-X-KEY (AES HLS)")
+        }
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
         callback(
             newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
@@ -169,11 +173,8 @@ class FlixCloud : ExtractorApi() {
     }
 
     /**
-     * Resolve relative against base, remap vault CDNs onto the signed fetch host,
-     * then re-attach JWT only when the final host matches the media playlist host.
-     *
-     * Vault hosts (slopnet/rundowncdn) reject the fetch-host JWT with HTTP 403;
-     * the same path on fetch*.flixcloud.cc accepts it.
+     * Resolve relative against base, remap vault/fetchN CDNs onto fetch.flixcloud.cc
+     * (the only host that serves segments), then re-attach the media-playlist JWT.
      */
     private fun resolveUrl(baseUrl: String, relative: String): String {
         val resolved = when {
@@ -186,32 +187,24 @@ class FlixCloud : ExtractorApi() {
             }
         }
         if (resolved.startsWith("data:")) return resolved
-        val remapped = remapToFetchHost(resolved, baseUrl)
-        return try {
-            val mediaHost = java.net.URL(baseUrl).host
-            val finalHost = java.net.URL(remapped).host
-            if (mediaHost.equals(finalHost, ignoreCase = true)) {
-                ensureQuery(remapped, queryOf(baseUrl))
-            } else {
-                // Foreign host: do not attach fetch JWT (causes vault 403)
-                remapped
-            }
-        } catch (_: Exception) {
-            ensureQuery(remapped, queryOf(baseUrl))
-        }
+        return ensureQuery(remapToFetchHost(resolved), queryOf(baseUrl))
     }
 
-    /** Move vault-*.slopnet / rundowncdn segment URLs onto fetch*.flixcloud.cc. */
-    private fun remapToFetchHost(url: String, mediaUrl: String): String {
+    /**
+     * Segments on vault-* / fetch7 / fetch1 403 or wrap oddly; fetch.flixcloud.cc
+     * is the working edge (confirmed in device logs).
+     */
+    private fun remapToFetchHost(url: String): String {
         return try {
-            val media = java.net.URL(mediaUrl)
             val u = java.net.URL(url)
-            if (u.host.equals(media.host, ignoreCase = true)) return url
             val h = u.host.lowercase()
-            val vaultLike = h.contains("vault") || h.contains("slopnet") ||
-                h.contains("rundowncdn") || (h.contains("cdn") && !h.contains("flixcloud"))
-            if (!vaultLike) return url
-            java.net.URL(media.protocol, media.host, u.file).toString()
+            if (h == "fetch.flixcloud.cc") return url
+            val remap = h.contains("vault") || h.contains("slopnet") ||
+                h.contains("rundowncdn") ||
+                (h.endsWith("flixcloud.cc") && h.startsWith("fetch")) ||
+                (h.contains("cdn") && !h.contains("flixcloud"))
+            if (!remap) return url
+            java.net.URL(u.protocol, "fetch.flixcloud.cc", u.file).toString()
         } catch (_: Exception) {
             url
         }

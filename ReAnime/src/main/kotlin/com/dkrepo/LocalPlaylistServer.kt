@@ -28,7 +28,9 @@ object LocalPlaylistServer {
     data class Session(
         val headers: Map<String, String>,
         val xorKey: ByteArray?,
-        val segmentReferer: String?
+        val segmentReferer: String?,
+        /** When playlist has #EXT-X-KEY, stripped bytes may still be AES ciphertext. */
+        val allowOpaque: Boolean = false
     )
 
     @Volatile
@@ -63,11 +65,12 @@ object LocalPlaylistServer {
         body: String,
         headers: Map<String, String>,
         xorKey: ByteArray? = null,
-        segmentReferer: String? = null
+        segmentReferer: String? = null,
+        allowOpaque: Boolean = false
     ): String {
         val p = ensureStarted()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
-        sessions[sessionId] = Session(headers, xorKey, segmentReferer)
+        sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque)
         val rewritten = rewritePlaylist(body, sessionId, p)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
@@ -180,18 +183,36 @@ object LocalPlaylistServer {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
                 return
             }
-            val cleaned = normalizeSegment(raw, session.xorKey)
-            if (!looksLikeTs(cleaned) && !looksLikeFmp4(cleaned)) {
+            var cleaned = normalizeSegment(raw, session.xorKey)
+            var opaque = false
+            if (cleaned == null && session.allowOpaque) {
+                // Image disguise around AES-128 HLS ciphertext — ExoPlayer decrypts via EXT-X-KEY
+                val stripped = stripImageContainer(raw)
+                cleaned = if (stripped !== raw && stripped.isNotEmpty()) stripped else null
+                opaque = cleaned != null
+            }
+            if (cleaned == null) {
+                // Last resort: scan RIFF chunks / full buffer for embedded media after XOR
+                cleaned = deepRecover(raw, session.xorKey)
+            }
+            if (cleaned == null) {
                 Log.w(
                     TAG,
-                    "segment still not media after normalize len=${cleaned.size} " +
-                        "head=${cleaned.take(8).joinToString("") { "%02x".format(it) }} " +
-                        "token=${remote.contains("token=")} url=${remote.take(100)}"
+                    "normalize failed len=${raw.size} " +
+                        "head=${raw.take(8).joinToString("") { "%02x".format(it) }} " +
+                        "xor=${session.xorKey != null} url=${remote.take(100)}"
                 )
-            } else {
-                Log.i(TAG, "segment ok len=${cleaned.size} from ${remote.substringBefore('?').take(80)}")
+                writeResponse(out, 502, "text/plain", ByteArray(0))
+                return
             }
-            writeResponse(out, 200, "video/mp2t", cleaned)
+            val mime = if (looksLikeFmp4(cleaned)) "video/mp4" else "video/mp2t"
+            Log.i(
+                TAG,
+                "segment ok len=${cleaned.size} mime=$mime opaque=$opaque " +
+                    "head=${cleaned.take(4).joinToString("") { "%02x".format(it) }} " +
+                    "from ${remote.substringBefore('?').take(80)}"
+            )
+            writeResponse(out, 200, mime, cleaned)
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             writeResponse(out, 502, "text/plain", ByteArray(0))
@@ -249,29 +270,129 @@ object LocalPlaylistServer {
         return null
     }
 
-    private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray {
-        var data = stripImageContainer(raw)
-        if (looksLikeTs(data) || looksLikeFmp4(data)) return data
+    /**
+     * Recover real MPEG-TS / fMP4 from FlixCloud image-disguised (and optionally
+     * XOR-wrapped) segment bodies. Returns null if nothing validates — never
+     * feed ExoPlayer a false-positive "TS" (that causes Encoding error).
+     */
+    private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
+        // 1) raw / xor(raw)
+        extractMedia(raw)?.let { return it }
         if (xorKey != null && xorKey.isNotEmpty()) {
-            val xored = ByteArray(data.size) { i ->
-                (data[i].toInt() xor xorKey[i % xorKey.size].toInt()).toByte()
-            }
-            val stripped = stripImageContainer(xored)
-            if (looksLikeTs(stripped) || looksLikeFmp4(stripped)) return stripped
-            if (looksLikeTs(xored) || looksLikeFmp4(xored)) return xored
-            findTsStart(xored)?.let { start ->
-                if (start > 0) return xored.copyOfRange(start, xored.size)
+            extractMedia(xorBytes(raw, xorKey))?.let { return it }
+        }
+
+        // 2) strip image container, then optional XOR
+        val stripped = stripImageContainer(raw)
+        if (stripped !== raw) {
+            extractMedia(stripped)?.let { return it }
+            if (xorKey != null && xorKey.isNotEmpty()) {
+                extractMedia(xorBytes(stripped, xorKey))?.let { return it }
             }
         }
-        findTsStart(data)?.let { start ->
-            if (start > 0) return data.copyOfRange(start, data.size)
+
+        // 3) XOR then strip (image magic itself may be XOR'd)
+        if (xorKey != null && xorKey.isNotEmpty()) {
+            val xored = xorBytes(raw, xorKey)
+            val xStrip = stripImageContainer(xored)
+            if (xStrip !== xored) {
+                extractMedia(xStrip)?.let { return it }
+            }
         }
-        return data
+        return null
+    }
+
+    private fun extractMedia(data: ByteArray): ByteArray? {
+        if (strictTs(data)) return data
+        if (looksLikeFmp4(data)) return data
+        findStrictTsStart(data)?.let { start ->
+            val sliced = if (start == 0) data else data.copyOfRange(start, data.size)
+            if (strictTs(sliced)) return sliced
+        }
+        val stripped = stripImageContainer(data)
+        if (stripped !== data) {
+            if (strictTs(stripped)) return stripped
+            if (looksLikeFmp4(stripped)) return stripped
+            findStrictTsStart(stripped)?.let { start ->
+                val sliced = if (start == 0) stripped else stripped.copyOfRange(start, stripped.size)
+                if (strictTs(sliced)) return sliced
+            }
+        }
+        return null
+    }
+
+    private fun xorBytes(data: ByteArray, key: ByteArray): ByteArray =
+        ByteArray(data.size) { i -> (data[i].toInt() xor key[i % key.size].toInt()).toByte() }
+
+    /** Walk RIFF chunks and try AES-CBC; used when simple strip/XOR fails. */
+    private fun deepRecover(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
+        for (base in listOfNotNull(raw, xorKey?.let { xorBytes(raw, it) })) {
+            extractRiffChunks(base).forEach { chunk ->
+                extractMedia(chunk)?.let { return it }
+                if (xorKey != null) extractMedia(xorBytes(chunk, xorKey))?.let { return it }
+            }
+            if (xorKey != null) {
+                tryAesDecrypt(base, xorKey)?.let { dec ->
+                    extractMedia(dec)?.let { return it }
+                    extractMedia(stripImageContainer(dec))?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun extractRiffChunks(data: ByteArray): List<ByteArray> {
+        if (data.size < 12) return emptyList()
+        if (!(data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
+                data[2] == 0x46.toByte() && data[3] == 0x46.toByte())
+        ) return emptyList()
+        val out = ArrayList<ByteArray>()
+        var pos = 12
+        while (pos + 8 <= data.size) {
+            val size = (data[pos + 4].toInt() and 0xff) or
+                ((data[pos + 5].toInt() and 0xff) shl 8) or
+                ((data[pos + 6].toInt() and 0xff) shl 16) or
+                ((data[pos + 7].toInt() and 0xff) shl 24)
+            if (size < 0 || pos + 8 + size > data.size) break
+            out.add(data.copyOfRange(pos + 8, pos + 8 + size))
+            pos += 8 + size + (size and 1)
+        }
+        return out
+    }
+
+    private fun tryAesDecrypt(data: ByteArray, key: ByteArray): ByteArray? {
+        if (data.size < 32) return null
+        val aligned = data.copyOf(data.size - (data.size % 16))
+        if (aligned.size < 32) return null
+        val keyVariants = buildList {
+            if (key.size >= 16) add(key.copyOf(16))
+            if (key.size >= 24) add(key.copyOf(24))
+            if (key.size >= 32) add(key.copyOf(32))
+        }
+        val ivs = listOf(ByteArray(16), if (key.size >= 16) key.copyOf(16) else ByteArray(16))
+        for (k in keyVariants) {
+            for (iv in ivs) {
+                for (transform in listOf("AES/CBC/NoPadding", "AES/CBC/PKCS5Padding")) {
+                    try {
+                        val cipher = javax.crypto.Cipher.getInstance(transform)
+                        cipher.init(
+                            javax.crypto.Cipher.DECRYPT_MODE,
+                            javax.crypto.spec.SecretKeySpec(k, "AES"),
+                            javax.crypto.spec.IvParameterSpec(iv)
+                        )
+                        val out = cipher.doFinal(aligned)
+                        if (out.isNotEmpty()) return out
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
-        // PNG
+        // PNG — payload after IEND+CRC (+ padding)
         if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
             data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
         ) {
@@ -283,11 +404,10 @@ object LocalPlaylistServer {
                 ) {
                     start++
                 }
-                findTsStart(data, start)?.let { return data.copyOfRange(it, data.size) }
                 if (start < data.size) return data.copyOfRange(start, data.size)
             }
         }
-        // RIFF / WEBP — skip full RIFF chunk then scan for TS
+        // RIFF / WEBP — payload after full RIFF chunk
         if (data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
             data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
         ) {
@@ -295,16 +415,25 @@ object LocalPlaylistServer {
                 ((data[5].toInt() and 0xff) shl 8) or
                 ((data[6].toInt() and 0xff) shl 16) or
                 ((data[7].toInt() and 0xff) shl 24)
-            val after = (8 + riffSize).coerceAtMost(data.size)
-            findTsStart(data, after)?.let { return data.copyOfRange(it, data.size) }
-            findTsStart(data, 12)?.let { return data.copyOfRange(it, data.size) }
+            val after = 8 + riffSize
+            if (after in 1 until data.size) return data.copyOfRange(after, data.size)
         }
         return data
     }
 
-    private fun looksLikeTs(data: ByteArray): Boolean {
-        if (data.size < 188) return false
-        return data[0] == 0x47.toByte() && data.size >= 376 && data[188] == 0x47.toByte()
+    /** Require several consecutive 0x47 syncs at 188-byte spacing (avoid WebP false positives). */
+    private fun strictTs(data: ByteArray): Boolean {
+        if (data.size < 188 * 5) return false
+        var i = 0
+        var count = 0
+        while (i + 188 <= data.size && count < 8) {
+            if (data[i] != 0x47.toByte()) return false
+            // basic TEI/PID sanity: transport_error_indicator should be 0
+            if ((data[i + 1].toInt() and 0x80) != 0) return false
+            count++
+            i += 188
+        }
+        return count >= 5
     }
 
     private fun looksLikeFmp4(data: ByteArray): Boolean {
@@ -313,13 +442,20 @@ object LocalPlaylistServer {
         return box == "ftyp" || box == "moof" || box == "mdat" || box == "styp"
     }
 
-    private fun findTsStart(data: ByteArray, from: Int = 0): Int? {
+    private fun findStrictTsStart(data: ByteArray, from: Int = 0): Int? {
         var i = from.coerceAtLeast(0)
-        while (i + 188 < data.size) {
-            if (data[i] == 0x47.toByte() &&
-                (i + 188 >= data.size || data[i + 188] == 0x47.toByte())
-            ) {
-                return i
+        val limit = data.size - 188 * 5
+        while (i <= limit) {
+            if (data[i] == 0x47.toByte()) {
+                var ok = true
+                for (n in 1 until 5) {
+                    val p = i + n * 188
+                    if (data[p] != 0x47.toByte() || (data[p + 1].toInt() and 0x80) != 0) {
+                        ok = false
+                        break
+                    }
+                }
+                if (ok) return i
             }
             i++
         }
