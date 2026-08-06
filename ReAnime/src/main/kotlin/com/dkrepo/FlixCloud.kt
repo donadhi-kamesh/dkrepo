@@ -15,6 +15,8 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+import android.util.Base64
+
 /**
  * Extractor for flixcloud.cc embeds (the player reanime.to uses).
  *
@@ -90,60 +92,75 @@ class FlixCloud : ExtractorApi() {
         }
         Log.i(TAG, "decrypted master url: ${masterUrl.take(90)}")
 
-        var quality = Qualities.Unknown.value
-        var targetUrl = masterUrl
-        var unwrappedMasterForLater: String? = null
-        try {
-            val raw = app.get(masterUrl, referer = "$mainUrl/", headers = headers).text
-            val trimmed = raw.trim()
-            val unwrapped = if (trimmed.startsWith("#EXTM3U")) trimmed
-                else wasmKey?.let { xorUnwrap(trimmed, it) } ?: ""
-            val text = unwrapped.trim()
-            if (text.startsWith("#EXTM3U")) {
-                quality = parseMasterQuality(text)
-                unwrappedMasterForLater = text
-                if (!trimmed.startsWith("#EXTM3U") && text != trimmed) {
-                    // wrapped master -> pick best variant so ExoPlayer gets playable URL
-                    extractBestVariant(text, masterUrl)?.let {
-                        targetUrl = it
-                        Log.i(TAG, "wrapped master, using variant $targetUrl")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "master probe failed: ${e.message}")
+        val masterText = fetchAndUnwrapPlaylist(masterUrl) ?: run {
+            Log.w(TAG, "master playlist fetch/unwrap failed for $masterUrl")
+            return
         }
 
-        // If target is a media playlist (video.m3u8) that is itself wrapped, unwrap it and
-        // resolve its segments to absolute URLs, then serve via data URI so ExoPlayer sees plain m3u8
-        try {
-            // Only probe if target looks like a media playlist candidate (video.m3u8 or similar)
-            // Fetch it once to check if it's wrapped
-            val probe = app.get(targetUrl, referer = "$mainUrl/", headers = headers).text.trim()
-            if (!probe.startsWith("#EXTM3U")) {
-                val unwrappedVariant = wasmKey?.let { xorUnwrap(probe, it) }?.trim() ?: ""
-                if (unwrappedVariant.startsWith("#EXTM3U")) {
-                    Log.i(TAG, "variant wrapped, unwrapping for playback")
-                    // Fix relative segment URLs in media playlist
-                    val fixed = fixMediaPlaylist(unwrappedVariant, targetUrl)
-                    // Data URI with base64 - ExoPlayer handles data: application/vnd.apple.mpegurl
-                    val b64 = android.util.Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-                    targetUrl = "data:application/vnd.apple.mpegurl;base64,$b64"
-                    Log.i(TAG, "using data URI for unwrapped variant")
-                }
+        val quality = parseMasterQuality(masterText)
+        val mediaUrl: String
+        val mediaText: String
+
+        if (masterText.contains("#EXT-X-STREAM-INF")) {
+            val variantUrl = extractBestVariant(masterText, masterUrl) ?: run {
+                Log.w(TAG, "failed to extract variant from master playlist")
+                return
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "variant unwrap probe failed: ${e.message}")
+            Log.i(TAG, "selected best variant url: ${variantUrl.take(90)}")
+            val variantText = fetchAndUnwrapPlaylist(variantUrl) ?: run {
+                Log.w(TAG, "variant playlist fetch/unwrap failed for $variantUrl")
+                return
+            }
+            mediaUrl = variantUrl
+            mediaText = variantText
+        } else {
+            mediaUrl = masterUrl
+            mediaText = masterText
         }
+
+        val absolutized = absolutizePlaylist(mediaText, mediaUrl)
+        val b64 = Base64.encodeToString(
+            absolutized.toByteArray(Charsets.UTF_8),
+            Base64.NO_WRAP
+        )
+        val playUrl = "data:application/vnd.apple.mpegurl;base64,$b64"
 
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
         callback(
-            newExtractorLink(this.name, linkName, targetUrl, ExtractorLinkType.M3U8) {
+            newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
                 this.referer = "$mainUrl/"
                 this.quality = quality
+                this.headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Origin" to mainUrl,
+                    "Referer" to "$mainUrl/"
+                )
             }
         )
-        Log.i(TAG, "emitted link $linkName -> $targetUrl")
+        Log.i(TAG, "emitted link $linkName -> data URI length ${playUrl.length}")
+    }
+
+    private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
+        return try {
+            val headers = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Origin" to mainUrl
+            )
+            val raw = app.get(url, referer = "$mainUrl/", headers = headers).text.trim()
+            if (raw.startsWith("#EXTM3U")) return raw
+
+            val key = wasmKey
+            if (key != null) {
+                val result = xorUnwrap(raw, key).trim()
+                if (result.startsWith("#EXTM3U")) return result
+            }
+
+            Log.w(TAG, "fetchAndUnwrapPlaylist: response body is not valid M3U8 for $url")
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchAndUnwrapPlaylist failed for $url: ${e.message}")
+            null
+        }
     }
 
     /** Runs the whole decryption chain and returns the master m3u8 URL. */
@@ -310,14 +327,27 @@ class FlixCloud : ExtractorApi() {
         }
     }
 
-    /** Fixes relative segment/key URLs in a media playlist to be absolute against baseUrl. */
-    private fun fixMediaPlaylist(mediaText: String, baseUrl: String): String {
+    /** Absolutizes segment URLs and URI="..." tag attributes in a media playlist against baseUrl. */
+    private fun absolutizePlaylist(mediaText: String, baseUrl: String): String {
         val base = try { java.net.URL(baseUrl) } catch (e: Exception) { return mediaText }
+        val uriTagRegex = Regex("""URI=["']([^"']+)["']""")
+
         return mediaText.lines().joinToString("\n") { line ->
             val t = line.trim()
             when {
-                t.isEmpty() || t.startsWith("#") -> line
-                t.startsWith("http") -> line
+                t.isEmpty() -> line
+                t.startsWith("#") -> {
+                    uriTagRegex.replace(line) { match ->
+                        val uri = match.groupValues[1]
+                        if (uri.startsWith("http://") || uri.startsWith("https://") || uri.startsWith("data:")) {
+                            match.value
+                        } else {
+                            val abs = try { java.net.URL(base, uri).toString() } catch (e: Exception) { uri }
+                            """URI="$abs""""
+                        }
+                    }
+                }
+                t.startsWith("http://") || t.startsWith("https://") || t.startsWith("data:") -> line
                 else -> try {
                     java.net.URL(base, t).toString()
                 } catch (e: Exception) { line }
