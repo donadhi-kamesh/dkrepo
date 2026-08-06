@@ -119,6 +119,14 @@ class FlixCloud : ExtractorApi() {
         }
 
         val absolutized = absolutizePlaylist(mediaText, mediaUrl)
+        val firstSegment = absolutized.lines()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+        Log.i(
+            TAG,
+            "first segment=${firstSegment?.take(90)} tokenPresent=${firstSegment?.contains("token=") == true}"
+        )
+
         val b64 = Base64.encodeToString(
             absolutized.toByteArray(Charsets.UTF_8),
             Base64.NO_WRAP
@@ -138,6 +146,24 @@ class FlixCloud : ExtractorApi() {
             }
         )
         Log.i(TAG, "emitted link $linkName -> data URI length ${playUrl.length}")
+    }
+
+    private fun queryOf(url: String): String? =
+        url.substringAfter('?', "").takeIf { it.isNotEmpty() }
+
+    /** Resolve relative against base, then re-attach base query if result has none. */
+    private fun resolveUrl(baseUrl: String, relative: String): String {
+        if (relative.startsWith("http://") || relative.startsWith("https://") || relative.startsWith("data:")) {
+            return relative
+        }
+        val resolved = try {
+            java.net.URL(java.net.URL(baseUrl), relative).toString()
+        } catch (e: Exception) {
+            return relative
+        }
+        val baseQuery = queryOf(baseUrl) ?: return resolved
+        if (resolved.contains('?')) return resolved
+        return "$resolved?$baseQuery"
     }
 
     private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
@@ -318,18 +344,12 @@ class FlixCloud : ExtractorApi() {
             }
         }
         if (bestUrl == null) return null
-        // resolve relative
-        return try {
-            if (bestUrl.startsWith("http")) bestUrl
-            else java.net.URL(java.net.URL(baseUrl), bestUrl).toString()
-        } catch (e: Exception) {
-            bestUrl
-        }
+        return resolveUrl(baseUrl, bestUrl)
     }
 
     /** Absolutizes segment URLs and URI="..." tag attributes in a media playlist against baseUrl. */
     private fun absolutizePlaylist(mediaText: String, baseUrl: String): String {
-        val base = try { java.net.URL(baseUrl) } catch (e: Exception) { return mediaText }
+        try { java.net.URL(baseUrl) } catch (e: Exception) { return mediaText }
         val uriTagRegex = Regex("""URI=["']([^"']+)["']""")
 
         return mediaText.lines().joinToString("\n") { line ->
@@ -339,18 +359,11 @@ class FlixCloud : ExtractorApi() {
                 t.startsWith("#") -> {
                     uriTagRegex.replace(line) { match ->
                         val uri = match.groupValues[1]
-                        if (uri.startsWith("http://") || uri.startsWith("https://") || uri.startsWith("data:")) {
-                            match.value
-                        } else {
-                            val abs = try { java.net.URL(base, uri).toString() } catch (e: Exception) { uri }
-                            """URI="$abs""""
-                        }
+                        val abs = resolveUrl(baseUrl, uri)
+                        """URI="$abs""""
                     }
                 }
-                t.startsWith("http://") || t.startsWith("https://") || t.startsWith("data:") -> line
-                else -> try {
-                    java.net.URL(base, t).toString()
-                } catch (e: Exception) { line }
+                else -> resolveUrl(baseUrl, t)
             }
         }
     }
