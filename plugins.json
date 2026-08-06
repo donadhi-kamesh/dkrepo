@@ -18,7 +18,7 @@
         "version": 10,
         "internalName": "ReAnime",
         "description": "Re:ANIME extension provider for Cloudstream",
-        "url": "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/ReAnime.cs3",
+        "url": "https://cdn.jsdelivr.net/gh/donadhi-kamesh/dkrepo@gh-pages/ReAnime.cs3",
         "name": "ReAnime"
     }
 ]
