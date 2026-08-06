@@ -129,20 +129,23 @@ class FlixCloud : ExtractorApi() {
             "first segment=${firstSegment.take(90)} tokenPresent=${firstSegment.contains("token=")}"
         )
 
-        // Serve unwrapped playlist from localhost:
+        // Serve unwrapped playlist from localhost and proxy segments:
         // - data: URIs → Cronet ERR_UNKNOWN_URL_SCHEME
         // - ExtractorLinkPlayList → RepoLinkGenerator drops blank url
-        val playUrl = LocalPlaylistServer.publish(absolutized)
+        // - absolute vault URLs drop JWT unless we re-attach it
+        // - .pn/.png/.webp segments need disguise/XOR strip before ExoPlayer
+        val playHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/"
+        )
+        val playUrl = LocalPlaylistServer.publish(absolutized, playHeaders, wasmKey)
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"
         callback(
             newExtractorLink(this.name, linkName, playUrl, ExtractorLinkType.M3U8) {
                 this.referer = "$mainUrl/"
                 this.quality = quality
-                this.headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/"
-                )
+                this.headers = playHeaders
             }
         )
         Log.i(TAG, "emitted link $linkName -> $playUrl")
@@ -151,19 +154,29 @@ class FlixCloud : ExtractorApi() {
     private fun queryOf(url: String): String? =
         url.substringAfter('?', "").takeIf { it.isNotEmpty() }
 
-    /** Resolve relative against base, then re-attach base query if result has none. */
+    /** Attach missing query params from [query] onto [url] (used for JWT token=). */
+    private fun ensureQuery(url: String, query: String?): String {
+        if (query.isNullOrEmpty() || url.startsWith("data:")) return url
+        // Prefer keeping an existing token=; otherwise append whole base query.
+        if (url.contains("token=")) return url
+        return if (url.contains('?')) "$url&$query" else "$url?$query"
+    }
+
+    /**
+     * Resolve relative against base, then re-attach base JWT query.
+     * Absolute CDN segment URLs (vault-*.rundowncdn.top) also need the token.
+     */
     private fun resolveUrl(baseUrl: String, relative: String): String {
-        if (relative.startsWith("http://") || relative.startsWith("https://") || relative.startsWith("data:")) {
-            return relative
+        val resolved = when {
+            relative.startsWith("http://") || relative.startsWith("https://") || relative.startsWith("data:") ->
+                relative
+            else -> try {
+                java.net.URL(java.net.URL(baseUrl), relative).toString()
+            } catch (_: Exception) {
+                relative
+            }
         }
-        val resolved = try {
-            java.net.URL(java.net.URL(baseUrl), relative).toString()
-        } catch (e: Exception) {
-            return relative
-        }
-        val baseQuery = queryOf(baseUrl) ?: return resolved
-        if (resolved.contains('?')) return resolved
-        return "$resolved?$baseQuery"
+        return ensureQuery(resolved, queryOf(baseUrl))
     }
 
     private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
