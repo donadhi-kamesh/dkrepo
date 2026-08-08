@@ -165,6 +165,104 @@ object LocalPlaylistServer {
             ?.let { URLDecoder.decode(it, "UTF-8") }
     }
 
+    /** True when a proxied URI ends in a playlist extension (.m3u8), ignoring query. */
+    private fun looksLikePlaylistUrl(url: String): Boolean {
+        val noQuery = url.substringBefore('?')
+        val base = noQuery.substringAfterLast('/')
+        return base.lowercase().contains("m3u8")
+    }
+
+    /**
+     * Serve a media/variant playlist (referenced from the master or from an
+     * #EXT-X-MEDIA audio group) back to ExoPlayer. These are NOT segments: they
+     * must be fetched, unwrapped (fetch7 base64-XOR), absolutized and have their
+     * own segment/URI references re-proxied so ExoPlayer can keep resolving the
+     * HLS chain. Before this, every referenced playlist was run through
+     * normalizeSegment() (which only accepts TS/fMP4), returning an empty 502
+     * and making ExoPlayer fail instantly with an "unsupported format" error.
+     */
+    private fun servePlaylist(remote: String, session: Session, sessionId: String, out: java.io.OutputStream) {
+        val raw = fetchPlaylistBytes(remote, session)
+        var text = raw?.let { String(it, Charsets.UTF_8) } ?: ""
+        if (!text.trimStart().startsWith("#EXTM3U") &&
+            session.xorKey != null && session.xorKey.isNotEmpty()
+        ) {
+            val unwrapped = xorUnwrapText(text, session.xorKey)
+            if (unwrapped.trimStart().startsWith("#EXTM3U")) text = unwrapped
+        }
+        if (!text.trimStart().startsWith("#EXTM3U")) {
+            Log.w(TAG, "media playlist unusable: ${remote.substringBefore('?').take(90)}")
+            writeResponse(out, 502, "text/plain", ByteArray(0))
+            return
+        }
+        val absolutized = absoluteize(text, remote)
+        val rewritten = rewritePlaylist(absolutized, sessionId, port)
+        writeResponse(out, 200, "application/vnd.apple.mpegurl", rewritten.toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * Fetch raw playlist bytes, preferring a real m3u8 over a Cloudflare
+     * challenge. Tries the OkHttp path first (covers slopnet/fetch hosts) and
+     * falls back to the hidden WebView (real Chromium TLS) which passes the
+     * vault*. Cloudflare zone.
+     */
+    private fun fetchPlaylistBytes(url: String, session: Session): ByteArray? {
+        fun usable(b: ByteArray?): Boolean {
+            if (b == null || b.isEmpty()) return false
+            val t = String(b, Charsets.UTF_8)
+            if (t.trimStart().startsWith("#EXTM3U")) return true
+            if (session.xorKey != null && session.xorKey.isNotEmpty() &&
+                xorUnwrapText(t, session.xorKey).trimStart().startsWith("#EXTM3U")
+            ) return true
+            return false
+        }
+        val ok = fetchViaOkHttp(url, session)
+        if (usable(ok)) return ok
+        val wv = runBlocking {
+            WebViewSegmentFetcher.fetchBytes(url, session.embedUrl ?: "https://flixcloud.cc/")
+        }
+        if (usable(wv)) return wv
+        return ok ?: wv
+    }
+
+    /** Absolutize relative segment/URI references in a playlist against baseUrl. */
+    private fun absoluteize(text: String, baseUrl: String): String {
+        try { java.net.URL(baseUrl) } catch (e: Exception) { return text }
+        val uriTagRegex = Regex("""URI=["']([^"']+)["']""")
+        fun resolve(ref: String): String =
+            if (ref.startsWith("http://") || ref.startsWith("https://") || ref.startsWith("data:")) ref
+            else try { java.net.URL(java.net.URL(baseUrl), ref).toString() } catch (e: Exception) { ref }
+        return text.lines().joinToString("\n") { line ->
+            val t = line.trim()
+            when {
+                t.isEmpty() -> line
+                t.startsWith("#") -> uriTagRegex.replace(line) { m ->
+                    """"URI="${resolve(m.groupValues[1])}""""
+                }
+                else -> resolve(t)
+            }
+        }
+    }
+
+    /** fetch7 playlists are base64( XOR(plaintext, repeating 32-byte key) ). */
+    private fun xorUnwrapText(raw: String, key: ByteArray): String {
+        val s = raw.trim()
+        val blob = try {
+            Base64.decode(s, Base64.DEFAULT)
+        } catch (e: Exception) {
+            try {
+                Base64.decode(s, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            } catch (e2: Exception) {
+                return ""
+            }
+        }
+        return try {
+            String(xorBytes(blob, key), Charsets.UTF_8)
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
     private fun serveSegment(sessionId: String, enc: String?, out: java.io.OutputStream) {
         val session = sessions[sessionId]
         if (session == null || enc.isNullOrBlank()) {
@@ -178,6 +276,13 @@ object LocalPlaylistServer {
             )
         } catch (e: Exception) {
             writeResponse(out, 400, "text/plain", ByteArray(0))
+            return
+        }
+        // A referenced *.m3u8 is itself a media/variant playlist that ExoPlayer
+        // must be able to fetch next (variant + #EXT-X-MEDIA audio groups), not a
+        // TS segment. Handle it separately so it is served as a valid playlist.
+        if (looksLikePlaylistUrl(remote)) {
+            servePlaylist(remote, session, sessionId, out)
             return
         }
         try {
