@@ -96,45 +96,27 @@ class FlixCloud : ExtractorApi() {
         }
 
         val quality = parseMasterQuality(masterText)
-        val mediaUrl: String
-        val mediaText: String
 
-        if (masterText.contains("#EXT-X-STREAM-INF")) {
-            val variantUrl = extractBestVariant(masterText, masterUrl) ?: run {
-                Log.w(TAG, "failed to extract variant from master playlist")
-                return
-            }
-            Log.i(TAG, "selected best variant url: ${variantUrl.take(90)}")
-            val variantText = fetchAndUnwrapPlaylist(variantUrl) ?: run {
-                Log.w(TAG, "variant playlist fetch/unwrap failed for $variantUrl")
-                return
-            }
-            mediaUrl = variantUrl
-            mediaText = variantText
-        } else {
-            mediaUrl = masterUrl
-            mediaText = masterText
-        }
-
-        val absolutized = absolutizePlaylist(mediaText, mediaUrl)
-        val firstSegment = absolutized.lines()
+        // Serve the MASTER playlist (not just the best video variant) so ExoPlayer
+        // sees the #EXT-X-MEDIA audio groups (Native/English) and fetches the
+        // audio renditions — the video segments are video-only MPEG-TS.
+        val absolutized = absolutizePlaylist(masterText, masterUrl)
+        val firstLine = absolutized.lines()
             .map { it.trim() }
             .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
-        if (firstSegment == null) {
-            Log.w(TAG, "no playable segments found in media playlist")
+        if (firstLine == null) {
+            Log.w(TAG, "no playable content found in master playlist")
             return
         }
         Log.i(
             TAG,
-            "first segment=${firstSegment.take(120)} tokenPresent=${firstSegment.contains("token=")} " +
-                "host=${runCatching { java.net.URL(firstSegment).host }.getOrNull()}"
+            "first playlist line=${firstLine.take(120)} isMaster=${masterText.contains("#EXT-X-STREAM-INF")} " +
+                "host=${runCatching { java.net.URL(firstLine).host }.getOrNull()}"
         )
 
         // Serve unwrapped playlist from localhost and proxy segments:
-        // - data: URIs → Cronet ERR_UNKNOWN_URL_SCHEME
-        // - ExtractorLinkPlayList → RepoLinkGenerator drops blank url
-        // - absolute vault URLs drop JWT unless we re-attach it
-        // - .pn/.png/.webp segments need disguise/XOR strip before ExoPlayer
+        // - .m3u8 lines/URI tags are re-proxied as playlists (audio groups + variant)
+        // - everything else is a segment, fetched via OkHttp -> WebView -> fetch host
         val playHeaders = mapOf(
             "User-Agent" to USER_AGENT,
             "Origin" to mainUrl,
@@ -144,11 +126,11 @@ class FlixCloud : ExtractorApi() {
             absolutized,
             playHeaders,
             wasmKey,
-            segmentReferer = mediaUrl,
-            allowOpaque = mediaText.contains("#EXT-X-KEY"),
+            segmentReferer = masterUrl,
+            allowOpaque = masterText.contains("#EXT-X-KEY"),
             embedUrl = url
         )
-        if (mediaText.contains("#EXT-X-KEY")) {
+        if (masterText.contains("#EXT-X-KEY")) {
             Log.i(TAG, "playlist declares #EXT-X-KEY (AES HLS)")
         }
         val linkName = if (serverLabel.isNullOrBlank()) this.name else "${this.name} $serverLabel"

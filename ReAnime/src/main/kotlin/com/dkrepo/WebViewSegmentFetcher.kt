@@ -222,7 +222,9 @@ object WebViewSegmentFetcher {
           window.__fcState = 'P';
           window.__fcParts = [];
           var url = '$quoted';
-          fetch(url, { credentials: 'include', mode: 'cors' }).then(function(r) {
+          // ACAO: * means credentialed fetches are rejected by the browser;
+          // segments need no cookies, so omit credentials.
+          fetch(url, { credentials: 'omit', mode: 'cors' }).then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.arrayBuffer();
           }).then(function(buf) {
