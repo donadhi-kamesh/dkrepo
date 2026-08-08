@@ -256,9 +256,9 @@ object LocalPlaylistServer {
             val token = session.segmentReferer
                 ?.substringAfter("token=", "")
                 ?.takeIf { it.isNotEmpty() }
-            if (token != null && url.contains("/_v7/")) {
-                val fetchUrl = "https://fetch.flixcloud.cc" +
-                    url.substringAfter("/_v7", "").substringBefore('?') + "?token=$token"
+            val path = runCatching { java.net.URL(url).path }.getOrNull()
+            if (token != null && path != null && path.startsWith("/_v7/")) {
+                val fetchUrl = "https://fetch.flixcloud.cc$path?token=$token"
                 val fb = fetchViaOkHttp(fetchUrl, session)
                 if (fb != null && normalizeSegment(fb, session.xorKey) != null) return fb
             }
