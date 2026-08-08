@@ -145,7 +145,8 @@ class FlixCloud : ExtractorApi() {
             playHeaders,
             wasmKey,
             segmentReferer = mediaUrl,
-            allowOpaque = mediaText.contains("#EXT-X-KEY")
+            allowOpaque = mediaText.contains("#EXT-X-KEY"),
+            embedUrl = url
         )
         if (mediaText.contains("#EXT-X-KEY")) {
             Log.i(TAG, "playlist declares #EXT-X-KEY (AES HLS)")
@@ -173,8 +174,13 @@ class FlixCloud : ExtractorApi() {
     }
 
     /**
-     * Resolve relative against base, remap vault/fetchN CDNs onto fetch.flixcloud.cc
-     * (the only host that serves segments), then re-attach the media-playlist JWT.
+     * Resolve relative against base, then re-attach the media-playlist JWT only
+     * when the final host matches the media playlist host.
+     *
+     * Segment URLs point at the real CDN (vault94.slopnet.site) and carry NO
+     * token — vault rejects the fetch-host JWT with HTTP 403. The proxy fetches
+     * them via OkHttp and a WebView fallback (the WebView's Chromium TLS passes
+     * vault's Cloudflare challenge that blocks OkHttp/curl).
      */
     private fun resolveUrl(baseUrl: String, relative: String): String {
         val resolved = when {
@@ -187,26 +193,16 @@ class FlixCloud : ExtractorApi() {
             }
         }
         if (resolved.startsWith("data:")) return resolved
-        return ensureQuery(remapToFetchHost(resolved), queryOf(baseUrl))
-    }
-
-    /**
-     * Segments on vault-* / fetch7 / fetch1 403 or wrap oddly; fetch.flixcloud.cc
-     * is the working edge (confirmed in device logs).
-     */
-    private fun remapToFetchHost(url: String): String {
         return try {
-            val u = java.net.URL(url)
-            val h = u.host.lowercase()
-            if (h == "fetch.flixcloud.cc") return url
-            val remap = h.contains("vault") || h.contains("slopnet") ||
-                h.contains("rundowncdn") ||
-                (h.endsWith("flixcloud.cc") && h.startsWith("fetch")) ||
-                (h.contains("cdn") && !h.contains("flixcloud"))
-            if (!remap) return url
-            java.net.URL(u.protocol, "fetch.flixcloud.cc", u.file).toString()
+            val mediaHost = java.net.URL(baseUrl).host
+            val finalHost = java.net.URL(resolved).host
+            if (mediaHost.equals(finalHost, ignoreCase = true)) {
+                ensureQuery(resolved, queryOf(baseUrl))
+            } else {
+                resolved
+            }
         } catch (_: Exception) {
-            url
+            ensureQuery(resolved, queryOf(baseUrl))
         }
     }
 

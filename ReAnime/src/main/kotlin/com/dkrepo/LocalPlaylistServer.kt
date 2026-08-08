@@ -30,7 +30,9 @@ object LocalPlaylistServer {
         val xorKey: ByteArray?,
         val segmentReferer: String?,
         /** When playlist has #EXT-X-KEY, stripped bytes may still be AES ciphertext. */
-        val allowOpaque: Boolean = false
+        val allowOpaque: Boolean = false,
+        /** flixcloud embed page, used to prime the WebView segment fetcher. */
+        val embedUrl: String? = null
     )
 
     @Volatile
@@ -66,11 +68,12 @@ object LocalPlaylistServer {
         headers: Map<String, String>,
         xorKey: ByteArray? = null,
         segmentReferer: String? = null,
-        allowOpaque: Boolean = false
+        allowOpaque: Boolean = false,
+        embedUrl: String? = null
     ): String {
         val p = ensureStarted()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
-        sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque)
+        sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         val rewritten = rewritePlaylist(body, sessionId, p)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
@@ -220,10 +223,54 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Fetch via Cloudstream's shared NiceHttp client (same stack that unwraps
-     * playlists). Bare OkHttp/HttpURLConnection get vault/CDN 403s.
+     * Fetch a segment from the first source that returns real playable media:
+     *  1. vault94/slopnet/rundowncdn (real CDN, no token) via OkHttp — works if
+     *     the device's OkHttp fingerprint passes the vault Cloudflare zone.
+     *  2. the same vault URL via the hidden WebView (real Chromium TLS + JS, so
+     *     the CF managed challenge passes).
+     *  3. fetch.flixcloud.cc with the media-playlist JWT as a last resort (its
+     *     segments are usually poisoned but occasionally serve real TS).
      */
     private fun fetchBytes(url: String, session: Session): ByteArray? {
+        val host = runCatching { java.net.URL(url).host.lowercase() }.getOrNull() ?: ""
+        val vaultLike = host.contains("vault") || host.contains("slopnet") ||
+            host.contains("rundowncdn") || (host.contains("cdn") && !host.contains("flixcloud"))
+
+        if (vaultLike) {
+            // 1) OkHttp fast path (real CDN, no token)
+            val ok = fetchViaOkHttp(url, session)
+            if (ok != null && normalizeSegment(ok, session.xorKey) != null) return ok
+            Log.w(TAG, "okhttp vault path yielded no media for ${url.substringBefore('?').take(90)}")
+
+            // 2) WebView path (real browser TLS passes the Cloudflare challenge)
+            val wv = runBlocking {
+                WebViewSegmentFetcher.fetchBytes(url, session.embedUrl ?: "https://flixcloud.cc/")
+            }
+            if (wv != null && normalizeSegment(wv, session.xorKey) != null) {
+                Log.i(TAG, "webview segment ok len=${wv.size} from ${url.substringBefore('?').take(80)}")
+                return wv
+            }
+            Log.w(TAG, "webview vault path yielded no media for ${url.substringBefore('?').take(90)}")
+
+            // 3) Last resort: same path on fetch.flixcloud.cc with the media JWT
+            val token = session.segmentReferer
+                ?.substringAfter("token=", "")
+                ?.takeIf { it.isNotEmpty() }
+            if (token != null && url.contains("/_v7/")) {
+                val fetchUrl = "https://fetch.flixcloud.cc" +
+                    url.substringAfter("/_v7", "").substringBefore('?') + "?token=$token"
+                val fb = fetchViaOkHttp(fetchUrl, session)
+                if (fb != null && normalizeSegment(fb, session.xorKey) != null) return fb
+            }
+            return null
+        }
+
+        // fetch.flixcloud.cc and other hosts: plain OkHttp path
+        return fetchViaOkHttp(url, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
+    }
+
+    /** Plain OkHttp fetch through Cloudstream's shared NiceHttp client. */
+    private fun fetchViaOkHttp(url: String, session: Session): ByteArray? {
         val referers = listOfNotNull(
             session.segmentReferer,
             "https://flixcloud.cc/",
