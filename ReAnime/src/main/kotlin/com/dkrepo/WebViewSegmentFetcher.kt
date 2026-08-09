@@ -227,7 +227,7 @@ object WebViewSegmentFetcher {
           // MUST include cookies (cf_clearance) — without them the vault CDN returns
           // a poisoned WEBP ("RIFF") instead of real TS. Cross-origin fetches keep
           // omit, because ACAO: * rejects credentialed cross-origin requests.
-          fetch(url, { credentials: 'include', mode: 'cors' }).then(function(r) {
+          fetch(url, { credentials: 'omit', mode: 'cors' }).then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.arrayBuffer();
           }).then(function(buf) {
