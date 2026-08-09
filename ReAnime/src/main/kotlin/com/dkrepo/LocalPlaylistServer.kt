@@ -329,25 +329,39 @@ object LocalPlaylistServer {
 
     /**
      * Fetch a segment from the first source that returns real playable media:
-     *  1. vault94/slopnet/rundowncdn (real CDN, no token) via OkHttp — works if
-     *     the device's OkHttp fingerprint passes the vault Cloudflare zone.
-     *  2. the same vault URL via the hidden WebView (real Chromium TLS + JS, so
+     *  1. vault94/slopnet/rundowncdn (real CDN) via OkHttp.
+     *  2. the same vault URL with the media-playlist JWT appended — vault serves
+     *     HTTP 403 / decoy images when the token is missing, so the token is
+     *     worth trying on the vault host too.
+     *  3. the same vault URL via the hidden WebView (real Chromium TLS + JS, so
      *     the CF managed challenge passes).
-     *  3. fetch.flixcloud.cc with the media-playlist JWT as a last resort (its
-     *     segments are usually poisoned but occasionally serve real TS).
+     *  4. fetch.flixcloud.cc with the media-playlist JWT as a last resort.
      */
     private fun fetchBytes(url: String, session: Session): ByteArray? {
         val host = runCatching { java.net.URL(url).host.lowercase() }.getOrNull() ?: ""
         val vaultLike = host.contains("vault") || host.contains("slopnet") ||
             host.contains("rundowncdn") || (host.contains("cdn") && !host.contains("flixcloud"))
+        val token = session.segmentReferer
+            ?.substringAfter("token=", "")
+            ?.takeIf { it.isNotEmpty() }
+        Log.i(TAG, "fetchBytes host=$host token=${token != null} ${url.substringBefore('?').take(90)}")
 
         if (vaultLike) {
-            // 1) OkHttp fast path (real CDN, no token)
+            // 1) OkHttp fast path on the raw URL
             val ok = fetchViaOkHttp(url, session)
             if (ok != null && normalizeSegment(ok, session.xorKey) != null) return ok
+
+            // 2) OkHttp with the media JWT appended (403/decoy without it)
+            if (token != null) {
+                val tokUrl = withToken(url, token)
+                if (tokUrl != url) {
+                    val okT = fetchViaOkHttp(tokUrl, session)
+                    if (okT != null && normalizeSegment(okT, session.xorKey) != null) return okT
+                }
+            }
             Log.w(TAG, "okhttp vault path yielded no media for ${url.substringBefore('?').take(90)}")
 
-            // 2) WebView path (real browser TLS passes the Cloudflare challenge)
+            // 3) WebView path (real browser TLS passes the Cloudflare challenge)
             val wv = runBlocking {
                 WebViewSegmentFetcher.fetchBytes(url, session.embedUrl ?: "https://flixcloud.cc/")
             }
@@ -357,10 +371,7 @@ object LocalPlaylistServer {
             }
             Log.w(TAG, "webview vault path yielded no media for ${url.substringBefore('?').take(90)}")
 
-            // 3) Last resort: same path on fetch.flixcloud.cc with the media JWT
-            val token = session.segmentReferer
-                ?.substringAfter("token=", "")
-                ?.takeIf { it.isNotEmpty() }
+            // 4) Last resort: same path on fetch.flixcloud.cc with the media JWT
             val path = runCatching { java.net.URL(url).path }.getOrNull()
             if (token != null && path != null && path.startsWith("/_v7/")) {
                 val fetchUrl = "https://fetch.flixcloud.cc$path?token=$token"
@@ -370,8 +381,20 @@ object LocalPlaylistServer {
             return null
         }
 
-        // fetch.flixcloud.cc and other hosts: plain OkHttp path
-        return fetchViaOkHttp(url, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
+        // fetch7/fetch.flixcloud.cc and other hosts: plain OkHttp path, retry with token
+        val plain = fetchViaOkHttp(url, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
+        if (plain != null) return plain
+        if (token != null) {
+            val tokUrl = withToken(url, token)
+            if (tokUrl != url) return fetchViaOkHttp(tokUrl, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
+        }
+        return null
+    }
+
+    /** Append `token=...` to [url] if it does not already carry a token. */
+    private fun withToken(url: String, token: String): String {
+        if (url.contains("token=")) return url
+        return if (url.contains('?')) "$url&token=$token" else "$url?token=$token"
     }
 
     /** Plain OkHttp fetch through Cloudstream's shared NiceHttp client. */
