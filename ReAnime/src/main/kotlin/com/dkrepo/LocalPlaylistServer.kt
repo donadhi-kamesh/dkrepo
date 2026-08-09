@@ -451,28 +451,23 @@ object LocalPlaylistServer {
      * feed ExoPlayer a false-positive "TS" (that causes Encoding error).
      */
     private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
-        // 1) raw / xor(raw)
-        extractMedia(raw)?.let { return it }
-        if (xorKey != null && xorKey.isNotEmpty()) {
-            extractMedia(xorBytes(raw, xorKey))?.let { return it }
-        }
-
-        // 2) strip image container, then optional XOR
+        // Order matters: strip any leading image magic FIRST so the XOR key aligns
+        // with the payload, then XOR, then validate TS. XORing the un-stripped
+        // buffer shifts the key by the header length and hides the 0x47 syncs.
         val stripped = stripImageContainer(raw)
-        if (stripped !== raw) {
-            extractMedia(stripped)?.let { return it }
-            if (xorKey != null && xorKey.isNotEmpty()) {
-                extractMedia(xorBytes(stripped, xorKey))?.let { return it }
-            }
+
+        // 1) raw body (no header) as-is
+        extractMedia(stripped)?.let { return it }
+
+        // 2) raw body XOR'd with the key (TS is XOR-obfuscated with a repeating key)
+        if (xorKey != null && xorKey.isNotEmpty()) {
+            extractMedia(xorBytes(stripped, xorKey))?.let { return it }
         }
 
-        // 3) XOR then strip (image magic itself may be XOR'd)
+        // 3) XOR the whole buffer, then strip the (now decrypted) header
         if (xorKey != null && xorKey.isNotEmpty()) {
             val xored = xorBytes(raw, xorKey)
-            val xStrip = stripImageContainer(xored)
-            if (xStrip !== xored) {
-                extractMedia(xStrip)?.let { return it }
-            }
+            extractMedia(stripImageContainer(xored))?.let { return it }
         }
         return null
     }
@@ -567,10 +562,12 @@ object LocalPlaylistServer {
 
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
-        // PNG — payload after IEND+CRC (+ padding)
+        // PNG magic (no real chunk/length structure — just a signature prefix
+        // followed by the obfuscated payload). Strip the 8-byte signature + padding.
         if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
             data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
         ) {
+            // Prefer real IEND boundary if present (payload appended after the image).
             val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
             if (iend >= 0) {
                 var start = iend + 8
@@ -581,6 +578,15 @@ object LocalPlaylistServer {
                 }
                 if (start < data.size) return data.copyOfRange(start, data.size)
             }
+            // No IEND: this is a bare image-magic prefix. Skip the 8-byte PNG
+            // signature (89 50 4E 47 0D 0A 1A 0A) and any trailing zeros/padding.
+            var start = 8
+            while (start < data.size &&
+                (data[start] == 0x00.toByte() || data[start] == 0xFF.toByte())
+            ) {
+                start++
+            }
+            if (start < data.size) return data.copyOfRange(start, data.size)
         }
         // RIFF / WEBP — payload after full RIFF chunk
         if (data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
@@ -592,6 +598,8 @@ object LocalPlaylistServer {
                 ((data[7].toInt() and 0xff) shl 24)
             val after = 8 + riffSize
             if (after in 1 until data.size) return data.copyOfRange(after, data.size)
+            // If the RIFF length looks bogus/huge, fall back to skipping the 8-byte header.
+            if (after >= data.size && data.size > 8) return data.copyOfRange(8, data.size)
         }
         return data
     }

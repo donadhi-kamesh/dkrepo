@@ -41,13 +41,6 @@ object WebViewSegmentFetcher {
     @Volatile
     private var primedEmbed: String? = null
 
-    /** Hosts we've already solved the vault Cloudflare challenge for. */
-    private val primedHosts = mutableSetOf<String>()
-
-    /** Host the WebView document is currently on (so we can re-prime on switch). */
-    @Volatile
-    private var primedHost: String? = null
-
     /** Fetch [url] through the WebView. Returns raw bytes or null on failure/timeout. */
     suspend fun fetchBytes(url: String, embedUrl: String): ByteArray? = mutex.withLock {
         try {
@@ -58,28 +51,21 @@ object WebViewSegmentFetcher {
                 return@withLock null
             }
 
-            // 2) prime the flixcloud page once so fetch() runs with a browser Origin.
-            //    Non-fatal: if the prime times out we still try (vault may send ACAO: *).
+            // 2) prime the flixcloud embed page and STAY on it. The real player runs
+            //    from flixcloud.cc and its hls.js fetches vault segments cross-origin
+            //    with Origin=flixcloud.cc + credentials (the embed page preloads
+            //    vault94 subtitles/fonts, which sets the vault cf_clearance cookie).
+            //    So we must keep Origin=flixcloud.cc (NOT navigate to the vault host)
+            //    and send credentials so that cookie flows.
             if (primedEmbed != embedUrl) {
                 val ok = primeUrl(embedUrl)
                 Log.i(TAG, "embed prime ${if (ok) "ok" else "failed/timed out"}")
                 primedEmbed = embedUrl
+                // give the embed page time to preload vault resources (sets cf_clearance)
+                delay(2000)
             }
 
-            // 3) prime the exact segment host so fetch() runs same-origin with its
-            //    cf_clearance cookie. Without that cookie vault serves a poisoned
-            //    WEBP (\"RIFF\") instead of real TS. Re-prime whenever ExoPlayer moves
-            //    to a different vault host; the 2s settle only happens on first visit.
-            val host = runCatching { java.net.URL(url).host }.getOrNull() ?: return@withLock null
-            if (primedHost != host) {
-                val firstTime = primedHosts.add(host)
-                val ok = primeUrl("https://$host/")
-                Log.i(TAG, "host prime ${if (ok) "ok" else "failed/timed out"} ($firstTime) $host")
-                primedHost = host
-                if (firstTime) delay(2000) // give the CF challenge JS a moment to store its cookie
-            }
-
-            // 4) start the fetch script (sets window.__fcState + window.__fcParts)
+            // 3) start the fetch script (sets window.__fcState + window.__fcParts)
             val started = Unit.mainWork {
                 try {
                     val wv = webView ?: return@mainWork false
@@ -241,9 +227,7 @@ object WebViewSegmentFetcher {
           // MUST include cookies (cf_clearance) — without them the vault CDN returns
           // a poisoned WEBP ("RIFF") instead of real TS. Cross-origin fetches keep
           // omit, because ACAO: * rejects credentialed cross-origin requests.
-          var sameOrigin = false;
-          try { sameOrigin = new URL(url).origin === location.origin; } catch (e) {}
-          fetch(url, { credentials: sameOrigin ? 'include' : 'omit', mode: 'cors' }).then(function(r) {
+          fetch(url, { credentials: 'include', mode: 'cors' }).then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.arrayBuffer();
           }).then(function(buf) {
