@@ -153,12 +153,21 @@ object WebViewSegmentFetcher {
     private suspend fun readParts(count: Int): String? {
         val sb = StringBuilder()
         for (i in 0 until count) {
-            val raw = evalJs("window.__fcParts[$i] ? window.__fcParts[$i] : null") ?: return null
-            val part = try {
-                (JSONTokener(raw).nextValue() as? String)
-            } catch (e: Exception) {
-                raw
-            } ?: return null
+            var part: String? = null
+            // Retry transient bridge failures (evaluateJavascript can drop a large
+            // reply under memory pressure); a single dropped chunk otherwise aborts
+            // the whole segment read ("webview parts read failed").
+            for (attempt in 0 until 3) {
+                val raw = evalJs("window.__fcParts[$i] ? window.__fcParts[$i] : null")
+                    ?: continue
+                part = try {
+                    (JSONTokener(raw).nextValue() as? String)
+                } catch (e: Exception) {
+                    raw
+                }
+                if (part != null) break
+            }
+            if (part == null) return null
             sb.append(part)
         }
         return sb.toString()
@@ -245,7 +254,9 @@ object WebViewSegmentFetcher {
               bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CH, bytes.length)));
             }
             var b64 = btoa(bin);
-            var CHUNK = 1000000;
+            // Keep chunks small: evaluateJavascript result callbacks silently drop
+            // very large strings, which made readParts fail for big (3MB+) segments.
+            var CHUNK = 200000;
             window.__fcParts = [];
             for (var i = 0; i < b64.length; i += CHUNK) {
               window.__fcParts.push(b64.substring(i, i + CHUNK));
