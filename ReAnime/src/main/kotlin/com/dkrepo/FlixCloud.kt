@@ -96,11 +96,8 @@ class FlixCloud : ExtractorApi() {
         }
 
         val quality = parseMasterQuality(masterText)
-
-        // Serve the MASTER playlist (not just the best video variant) so ExoPlayer
-        // sees the #EXT-X-MEDIA audio groups (Native/English) and fetches the
-        // audio renditions — the video segments are video-only MPEG-TS.
-        val absolutized = absolutizePlaylist(masterText, masterUrl)
+        val slim = slimMaster(masterText, masterUrl)
+        val absolutized = absolutizePlaylist(slim, masterUrl)
         val firstLine = absolutized.lines()
             .map { it.trim() }
             .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
@@ -386,6 +383,44 @@ class FlixCloud : ExtractorApi() {
         }
         if (bestUrl == null) return null
         return resolveUrl(baseUrl, bestUrl)
+    }
+
+    /**
+     * Keep audio groups + a single video variant. Extra qualities make extract
+     * and startup fetch every rendition through the local proxy.
+     */
+    private fun slimMaster(master: String, baseUrl: String): String {
+        val best = extractBestVariant(master, baseUrl) ?: return master
+        val lines = master.lines()
+        val out = ArrayList<String>(lines.size)
+        var i = 0
+        while (i < lines.size) {
+            val raw = lines[i]
+            val l = raw.trim()
+            when {
+                l.startsWith("#EXT-X-I-FRAME-STREAM-INF") -> i++
+                l.startsWith("#EXT-X-STREAM-INF") -> {
+                    val next = lines.getOrNull(i + 1)?.trim()
+                    val abs = if (!next.isNullOrEmpty() && !next.startsWith("#")) {
+                        resolveUrl(baseUrl, next)
+                    } else null
+                    if (abs == best) {
+                        out.add(raw)
+                        if (next != null) {
+                            out.add(lines[i + 1])
+                            i += 2
+                            continue
+                        }
+                    }
+                    i += if (next != null && !next.startsWith("#")) 2 else 1
+                }
+                else -> {
+                    out.add(raw)
+                    i++
+                }
+            }
+        }
+        return if (out.any { it.trim().startsWith("#EXT-X-STREAM-INF") }) out.joinToString("\n") else master
     }
 
     /** Absolutizes segment URLs and URI="..." tag attributes in a media playlist against baseUrl. */

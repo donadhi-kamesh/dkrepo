@@ -85,7 +85,7 @@ object LocalPlaylistServer {
         val p = ensureStarted()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
-        val rewritten = rewritePlaylist(body, sessionId, p, prefetchPlaylists = true)
+        val rewritten = rewritePlaylist(body, sessionId, p, prefetchPlaylists = false)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
         trimMaps()
@@ -284,7 +284,9 @@ object LocalPlaylistServer {
         }
         val vod = ensureVod(absoluteize(text, remote))
         val rewritten = rewritePlaylist(vod, sessionId, port, prefetchPlaylists = false)
-        writeResponse(out, 200, "application/vnd.apple.mpegurl", rewritten.toByteArray(Charsets.UTF_8), cache = true)
+        val bytes = rewritten.toByteArray(Charsets.UTF_8)
+        writeResponse(out, 200, "application/vnd.apple.mpegurl", bytes, cache = true)
+        prefetchPlaylistHead(vod, session)
     }
 
     /**
@@ -303,14 +305,18 @@ object LocalPlaylistServer {
             ) return true
             return false
         }
-        val resolved = rewriteCdnHost(url)
-        val ok = fetchViaOkHttp(resolved, session)
+        val token = session.segmentReferer
+            ?.substringAfter("token=", "")
+            ?.takeIf { it.isNotEmpty() }
+        val primary = v7FetchUrl(url, token)
+        val ok = fetchViaOkHttp(primary, session)
         if (usable(ok)) return ok
-        val wv = runBlocking {
-            WebViewSegmentFetcher.fetchBytes(resolved, session.embedUrl ?: "https://flixcloud.cc/")
+        val fallback = rewriteCdnHost(url)
+        if (fallback != primary) {
+            val ok2 = fetchViaOkHttp(fallback, session)
+            if (usable(ok2)) return ok2
         }
-        if (usable(wv)) return wv
-        return ok ?: wv
+        return ok
     }
 
     /** Absolutize relative segment/URI references in a playlist against baseUrl. */
@@ -428,6 +434,7 @@ object LocalPlaylistServer {
             writeResponse(out, 200, mime, cleaned, cache = true)
             segmentCache[remote] = cleaned
             trimMaps()
+            prefetchNeighbors(remote, session)
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             writeResponse(out, 502, "text/plain", ByteArray(0))
@@ -435,18 +442,24 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Fetch a segment from the first source that returns real playable media.
-     * Host allowlists are intentionally avoided: CDNs rotate (vault*, lock*.stronghole,
-     * rundowncdn, fetch.flixcloud.cc, …) and unknown hosts used to 403 with no fallback.
+     * Vault/lock/rundown CDN hosts 403 OkHttp. The working path is always
+     * fetch.flixcloud.cc + JWT. Skip the 403 round-trips and skip WebView.
      */
-    private fun fetchBytes(url: String, session: Session): ByteArray? {
+    private fun v7FetchUrl(url: String, token: String?): String {
         val resolved = rewriteCdnHost(url)
-        val host = runCatching { java.net.URL(resolved).host.lowercase() }.getOrNull() ?: ""
         val path = runCatching { java.net.URL(resolved).path }.getOrNull()
+        val base = if (path != null && path.startsWith("/_v7/")) {
+            "https://fetch.flixcloud.cc$path"
+        } else resolved
+        return if (!token.isNullOrEmpty()) withToken(base, token) else base
+    }
+
+    private fun fetchBytes(url: String, session: Session): ByteArray? {
         val token = session.segmentReferer
             ?.substringAfter("token=", "")
             ?.takeIf { it.isNotEmpty() }
-        Log.i(TAG, "fetchBytes host=$host token=${token != null} ${resolved.substringBefore('?').take(90)}")
+        val primary = v7FetchUrl(url, token)
+        Log.i(TAG, "fetchBytes ${primary.substringBefore('?').take(90)}")
 
         var lastRaw: ByteArray? = null
         fun consider(bytes: ByteArray?): ByteArray? {
@@ -456,35 +469,55 @@ object LocalPlaylistServer {
             return null
         }
 
-        consider(fetchViaOkHttp(resolved, session))?.let { return it }
-
-        if (token != null) {
-            val tokUrl = withToken(resolved, token)
-            if (tokUrl != resolved) consider(fetchViaOkHttp(tokUrl, session))?.let { return it }
+        consider(fetchViaOkHttp(primary, session))?.let { return it }
+        if (token != null && !primary.contains("token=")) {
+            consider(fetchViaOkHttp(withToken(primary, token), session))?.let { return it }
         }
+        return lastRaw
+    }
 
-        if (path != null && path.startsWith("/_v7/") && !host.contains("flixcloud")) {
-            val fetchUrl = if (token != null) {
-                "https://fetch.flixcloud.cc$path?token=$token"
-            } else {
-                "https://fetch.flixcloud.cc$path"
+    private fun prefetchNeighbors(remote: String, session: Session) {
+        val match = Regex("seg-(\\d+)").find(remote) ?: return
+        val n = match.groupValues[1].toIntOrNull() ?: return
+        thread(isDaemon = true, name = "FlixCloud-Prefetch") {
+            for (delta in 1..5) {
+                val next = remote.replaceFirst("seg-$n", "seg-${n + delta}")
+                val key = rewriteCdnHost(next)
+                if (segmentCache.containsKey(key) || segmentCache.containsKey(next)) continue
+                try {
+                    val raw = fetchBytes(next, session) ?: continue
+                    val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
+                    segmentCache[key] = cleaned
+                    segmentCache[next] = cleaned
+                } catch (_: Exception) {
+                }
             }
-            consider(fetchViaOkHttp(fetchUrl, session))?.let { return it }
+            trimMaps()
         }
+    }
 
-        val leftover = lastRaw
-        if (leftover != null && (isPngMagic(leftover) || isRiffMagic(leftover))) {
-            return leftover
+    private fun prefetchPlaylistHead(playlist: String, session: Session) {
+        val urls = playlist.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("http://") || it.startsWith("https://") }
+            .filter { !looksLikePlaylistUrl(it) }
+            .take(6)
+            .toList()
+        if (urls.isEmpty()) return
+        thread(isDaemon = true, name = "FlixCloud-PrefetchHead") {
+            for (u in urls) {
+                val key = rewriteCdnHost(u)
+                if (segmentCache.containsKey(key) || segmentCache.containsKey(u)) continue
+                try {
+                    val raw = fetchBytes(u, session) ?: continue
+                    val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
+                    segmentCache[key] = cleaned
+                    segmentCache[u] = cleaned
+                } catch (_: Exception) {
+                }
+            }
+            trimMaps()
         }
-
-        val wv = runBlocking {
-            WebViewSegmentFetcher.fetchBytes(resolved, session.embedUrl ?: "https://flixcloud.cc/")
-        }
-        consider(wv)?.let {
-            Log.i(TAG, "webview segment ok len=${it.size} from ${resolved.substringBefore('?').take(80)}")
-            return it
-        }
-        return leftover ?: wv
     }
 
     /** Append `token=...` to [url] if it does not already carry a token. */
@@ -496,48 +529,35 @@ object LocalPlaylistServer {
     /** Plain OkHttp fetch through Cloudstream's shared NiceHttp client. */
     private fun fetchViaOkHttp(url: String, session: Session): ByteArray? {
         val resolved = rewriteCdnHost(url)
-        val referers = listOfNotNull(
-            "https://flixcloud.cc/",
-            session.headers["Referer"]?.takeIf { it.contains("flixcloud.cc") },
-            session.segmentReferer?.takeIf { !it.contains("fetch") || it.contains("://fetch.flixcloud.cc") }
-        ).distinct()
         val baseHeaders = mapOf(
             "User-Agent" to (session.headers["User-Agent"] ?: "Mozilla/5.0"),
             "Accept" to "*/*"
         )
-
-        for (ref in referers) {
-            try {
-                val res = runBlocking {
-                    app.get(
-                        resolved,
-                        referer = ref,
-                        headers = baseHeaders,
-                        timeout = 15
-                    )
-                }
-                if (!res.isSuccessful) {
-                    Log.w(
-                        TAG,
-                        "upstream HTTP ${res.code} ref=${ref.take(70)} " +
-                            "token=${resolved.contains("token=")} url=${resolved.take(110)}"
-                    )
-                    continue
-                }
-                val bytes = res.body.bytes()
-                if (bytes.isNotEmpty()) {
-                    Log.i(
-                        TAG,
-                        "fetched ${bytes.size}b head=${bytes.take(4).joinToString("") { "%02x".format(it) }} " +
-                            "url=${resolved.substringBefore('?').take(80)}"
-                    )
-                    return bytes
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "fetch failed ref=${ref.take(70)}: ${e.message}")
+        try {
+            val res = runBlocking {
+                app.get(
+                    resolved,
+                    referer = "https://flixcloud.cc/",
+                    headers = baseHeaders,
+                    timeout = 8
+                )
             }
+            if (!res.isSuccessful) {
+                Log.w(TAG, "upstream HTTP ${res.code} url=${resolved.take(110)}")
+                return null
+            }
+            val bytes = res.body.bytes()
+            if (bytes.isNotEmpty()) {
+                Log.i(
+                    TAG,
+                    "fetched ${bytes.size}b head=${bytes.take(4).joinToString("") { "%02x".format(it) }} " +
+                        "url=${resolved.substringBefore('?').take(80)}"
+                )
+                return bytes
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetch failed ${resolved.take(80)}: ${e.message}")
         }
-        Log.w(TAG, "segment fetch failed: token=${resolved.contains("token=")} ${resolved.take(110)}")
         return null
     }
 
