@@ -175,16 +175,22 @@ class FlixCloud : ExtractorApi() {
             }
         }
         if (resolved.startsWith("data:")) return resolved
+        val withHost = resolved.replace(
+            Regex("(?i)https://fetch\\d+\\.flixcloud\\.cc"),
+            "https://fetch.flixcloud.cc"
+        )
         return try {
             val mediaHost = java.net.URL(baseUrl).host
-            val finalHost = java.net.URL(resolved).host
-            if (mediaHost.equals(finalHost, ignoreCase = true)) {
-                ensureQuery(resolved, queryOf(baseUrl))
+            val finalHost = java.net.URL(withHost).host
+            if (mediaHost.equals(finalHost, ignoreCase = true) ||
+                finalHost.equals("fetch.flixcloud.cc", ignoreCase = true)
+            ) {
+                ensureQuery(withHost, queryOf(baseUrl))
             } else {
-                resolved
+                withHost
             }
         } catch (_: Exception) {
-            ensureQuery(resolved, queryOf(baseUrl))
+            ensureQuery(withHost, queryOf(baseUrl))
         }
     }
 
@@ -193,28 +199,31 @@ class FlixCloud : ExtractorApi() {
             "User-Agent" to USER_AGENT,
             "Origin" to mainUrl
         )
+        val candidates = listOf(url, url.replace(Regex("(?i)https://fetch\\d+\\.flixcloud\\.cc"), "https://fetch.flixcloud.cc")).distinct()
         var lastError: String? = null
-        repeat(3) { attempt ->
-            try {
-                val raw = app.get(
-                    url,
-                    referer = "$mainUrl/",
-                    headers = headers,
-                    timeout = 60
-                ).text.trim()
-                if (raw.startsWith("#EXTM3U")) return raw
+        for (candidate in candidates) {
+            repeat(2) { attempt ->
+                try {
+                    val raw = app.get(
+                        candidate,
+                        referer = "$mainUrl/",
+                        headers = headers,
+                        timeout = 20
+                    ).text.trim()
+                    if (raw.startsWith("#EXTM3U")) return raw
 
-                val key = wasmKey
-                if (key != null) {
-                    val result = xorUnwrap(raw, key).trim()
-                    if (result.startsWith("#EXTM3U")) return result
+                    val key = wasmKey
+                    if (key != null) {
+                        val result = xorUnwrap(raw, key).trim()
+                        if (result.startsWith("#EXTM3U")) return result
+                    }
+
+                    lastError = "response body is not valid M3U8"
+                    Log.w(TAG, "fetchAndUnwrapPlaylist: $lastError for $candidate (attempt ${attempt + 1})")
+                } catch (e: Exception) {
+                    lastError = e.message
+                    Log.w(TAG, "fetchAndUnwrapPlaylist failed for $candidate (attempt ${attempt + 1}): ${e.message}")
                 }
-
-                lastError = "response body is not valid M3U8"
-                Log.w(TAG, "fetchAndUnwrapPlaylist: $lastError for $url (attempt ${attempt + 1})")
-            } catch (e: Exception) {
-                lastError = e.message
-                Log.w(TAG, "fetchAndUnwrapPlaylist failed for $url (attempt ${attempt + 1}): ${e.message}")
             }
         }
         Log.w(TAG, "fetchAndUnwrapPlaylist giving up for $url: $lastError")
