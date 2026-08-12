@@ -25,6 +25,15 @@ object LocalPlaylistServer {
     private val playlists = ConcurrentHashMap<String, ByteArray>()
     private val sessions = ConcurrentHashMap<String, Session>()
 
+    /**
+     * Fixed 16-byte repeating XOR key from FlixCloud's forked hls.js
+     * (`artplayer-new/hls.js`). WASM `_c()` is only for playlist unwrap.
+     */
+    private val SEGMENT_XOR_KEY = byteArrayOf(
+        157.toByte(), 42, 241.toByte(), 71, 179.toByte(), 142.toByte(), 92, 112,
+        166.toByte(), 25, 228.toByte(), 59, 216.toByte(), 98, 15, 197.toByte()
+    )
+
     data class Session(
         val headers: Map<String, String>,
         val xorKey: ByteArray?,
@@ -444,29 +453,24 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Recover real MPEG-TS / fMP4 / packed ADTS from FlixCloud image-disguised
-     * (and optionally XOR-wrapped) segment bodies. Returns null if nothing
-     * validates — never feed ExoPlayer a false-positive "TS".
+     * Recover MPEG-TS / fMP4 / packed ADTS. Matches FlixCloud hls.js:
+     * WEBP wrapper is 12 bytes (RIFF+size+WEBP), PNG is 8 bytes; then XOR with
+     * a fixed 16-byte key unless the payload already starts with 0x47.
      */
     private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
-        // The XOR key must stay aligned with the TS payload. Walking 0x00/0xFF
-        // "padding" after the 8-byte PNG signature used to shift the key whenever
-        // the first XOR'd byte happened to be 0x00 or 0xFF (0x47 xor key[0]).
-        val views = ArrayList<ByteArray>(4)
-        views.add(raw)
         val stripped = stripImageContainer(raw)
-        if (stripped !== raw) views.add(stripped)
-        if ((isPngMagic(raw) || isRiffMagic(raw)) && raw.size > 8) {
-            val exact = raw.copyOfRange(8, raw.size)
-            if (stripped !== exact) views.add(exact)
+        extractMedia(stripped)?.let { return it }
+
+        // Player: skip XOR when the first payload byte is already a TS sync.
+        if (stripped.isNotEmpty() && stripped[0] != 0x47.toByte()) {
+            extractMedia(xorBytes(stripped, SEGMENT_XOR_KEY))?.let { return it }
         }
 
-        for (view in views) {
-            extractMedia(view)?.let { return it }
-            if (xorKey != null && xorKey.isNotEmpty()) {
-                extractMedia(xorBytes(view, xorKey))?.let { return it }
-            }
+        if (xorKey != null && xorKey.isNotEmpty() && xorKey !== SEGMENT_XOR_KEY) {
+            extractMedia(xorBytes(stripped, xorKey))?.let { return it }
+            if (stripped !== raw) extractMedia(xorBytes(raw, xorKey))?.let { return it }
         }
+        if (stripped !== raw) extractMedia(raw)?.let { return it }
         return null
     }
 
@@ -486,13 +490,14 @@ object LocalPlaylistServer {
 
     /** Walk RIFF chunks and try AES-CBC; used when simple strip/XOR fails. */
     private fun deepRecover(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
-        for (base in listOfNotNull(raw, xorKey?.let { xorBytes(raw, it) })) {
+        val keys = listOfNotNull(SEGMENT_XOR_KEY, xorKey)
+        for (base in listOf(raw) + keys.map { xorBytes(raw, it) }) {
             extractRiffChunks(base).forEach { chunk ->
                 extractMedia(chunk)?.let { return it }
-                if (xorKey != null) extractMedia(xorBytes(chunk, xorKey))?.let { return it }
+                for (k in keys) extractMedia(xorBytes(chunk, k))?.let { return it }
             }
-            if (xorKey != null) {
-                tryAesDecrypt(base, xorKey)?.let { dec ->
+            for (k in keys) {
+                tryAesDecrypt(base, k)?.let { dec ->
                     extractMedia(dec)?.let { return it }
                     extractMedia(stripImageContainer(dec))?.let { return it }
                 }
@@ -568,17 +573,17 @@ object LocalPlaylistServer {
             data[12] == 0x49.toByte() && data[13] == 0x48.toByte() &&
             data[14] == 0x44.toByte() && data[15] == 0x52.toByte()
 
-    private fun isRealRiff(data: ByteArray): Boolean {
-        if (data.size < 12) return false
-        val form = String(data, 8, 4, Charsets.US_ASCII)
-        return form == "WEBP" || form == "WAVE" || form == "AVI "
-    }
-
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
+        // Fake WEBP: RIFF....WEBP + XOR payload. Always skip the 12-byte header
+        // (hls.js uses slice(12)). A zero/huge RIFF size is not a real image.
+        if (data.size >= 12 && isRiffMagic(data) &&
+            data[8] == 0x57.toByte() && data[9] == 0x45.toByte() &&
+            data[10] == 0x42.toByte() && data[11] == 0x50.toByte()
+        ) {
+            return data.copyOfRange(12, data.size)
+        }
         if (isPngMagic(data)) {
-            // Only search for IEND in a real PNG. XOR'd TS after a fake 8-byte
-            // signature can coincidentally contain "IEND" and would slice wrong.
             if (isRealPng(data)) {
                 val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
                 if (iend >= 0 && iend + 8 < data.size) {
@@ -587,16 +592,8 @@ object LocalPlaylistServer {
             }
             return data.copyOfRange(8, data.size)
         }
-        if (isRiffMagic(data)) {
-            if (isRealRiff(data)) {
-                val riffSize = (data[4].toInt() and 0xff) or
-                    ((data[5].toInt() and 0xff) shl 8) or
-                    ((data[6].toInt() and 0xff) shl 16) or
-                    ((data[7].toInt() and 0xff) shl 24)
-                val after = 8 + riffSize
-                if (after in 1 until data.size) return data.copyOfRange(after, data.size)
-            }
-            return data.copyOfRange(8, data.size)
+        if (isRiffMagic(data) && data.size > 12) {
+            return data.copyOfRange(12, data.size)
         }
         return data
     }
