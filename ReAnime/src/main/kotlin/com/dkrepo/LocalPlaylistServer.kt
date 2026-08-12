@@ -237,7 +237,7 @@ object LocalPlaylistServer {
             when {
                 t.isEmpty() -> line
                 t.startsWith("#") -> uriTagRegex.replace(line) { m ->
-                    """"URI="${resolve(m.groupValues[1])}""""
+                    """URI="${resolve(m.groupValues[1])}""""
                 }
                 else -> resolve(t)
             }
@@ -313,7 +313,11 @@ object LocalPlaylistServer {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
                 return
             }
-            val mime = if (looksLikeFmp4(cleaned)) "video/mp4" else "video/mp2t"
+            val mime = when {
+                looksLikeFmp4(cleaned) -> "video/mp4"
+                looksLikeAdts(cleaned) -> "audio/aac"
+                else -> "video/mp2t"
+            }
             Log.i(
                 TAG,
                 "segment ok len=${cleaned.size} mime=$mime opaque=$opaque " +
@@ -328,67 +332,61 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Fetch a segment from the first source that returns real playable media:
-     *  1. vault94/slopnet/rundowncdn (real CDN) via OkHttp.
-     *  2. the same vault URL with the media-playlist JWT appended — vault serves
-     *     HTTP 403 / decoy images when the token is missing, so the token is
-     *     worth trying on the vault host too.
-     *  3. the same vault URL via the hidden WebView (real Chromium TLS + JS, so
-     *     the CF managed challenge passes).
-     *  4. fetch.flixcloud.cc with the media-playlist JWT as a last resort.
+     * Fetch a segment from the first source that returns real playable media.
+     * Host allowlists are intentionally avoided: CDNs rotate (vault*, lock*.stronghole,
+     * rundowncdn, fetch.flixcloud.cc, …) and unknown hosts used to 403 with no fallback.
      */
     private fun fetchBytes(url: String, session: Session): ByteArray? {
         val host = runCatching { java.net.URL(url).host.lowercase() }.getOrNull() ?: ""
-        val vaultLike = host.contains("vault") || host.contains("slopnet") ||
-            host.contains("rundowncdn") || (host.contains("cdn") && !host.contains("flixcloud"))
+        val path = runCatching { java.net.URL(url).path }.getOrNull()
         val token = session.segmentReferer
             ?.substringAfter("token=", "")
             ?.takeIf { it.isNotEmpty() }
         Log.i(TAG, "fetchBytes host=$host token=${token != null} ${url.substringBefore('?').take(90)}")
 
-        if (vaultLike) {
-            // 1) OkHttp fast path on the raw URL
-            val ok = fetchViaOkHttp(url, session)
-            if (ok != null && normalizeSegment(ok, session.xorKey) != null) return ok
-
-            // 2) OkHttp with the media JWT appended (403/decoy without it)
-            if (token != null) {
-                val tokUrl = withToken(url, token)
-                if (tokUrl != url) {
-                    val okT = fetchViaOkHttp(tokUrl, session)
-                    if (okT != null && normalizeSegment(okT, session.xorKey) != null) return okT
-                }
-            }
-            Log.w(TAG, "okhttp vault path yielded no media for ${url.substringBefore('?').take(90)}")
-
-            // 3) WebView path (real browser TLS passes the Cloudflare challenge)
-            val wv = runBlocking {
-                WebViewSegmentFetcher.fetchBytes(url, session.embedUrl ?: "https://flixcloud.cc/")
-            }
-            if (wv != null && normalizeSegment(wv, session.xorKey) != null) {
-                Log.i(TAG, "webview segment ok len=${wv.size} from ${url.substringBefore('?').take(80)}")
-                return wv
-            }
-            Log.w(TAG, "webview vault path yielded no media for ${url.substringBefore('?').take(90)}")
-
-            // 4) Last resort: same path on fetch.flixcloud.cc with the media JWT
-            val path = runCatching { java.net.URL(url).path }.getOrNull()
-            if (token != null && path != null && path.startsWith("/_v7/")) {
-                val fetchUrl = "https://fetch.flixcloud.cc$path?token=$token"
-                val fb = fetchViaOkHttp(fetchUrl, session)
-                if (fb != null && normalizeSegment(fb, session.xorKey) != null) return fb
-            }
+        var lastRaw: ByteArray? = null
+        fun consider(bytes: ByteArray?): ByteArray? {
+            if (bytes == null || bytes.isEmpty()) return null
+            lastRaw = bytes
+            if (normalizeSegment(bytes, session.xorKey) != null) return bytes
             return null
         }
 
-        // fetch7/fetch.flixcloud.cc and other hosts: plain OkHttp path, retry with token
-        val plain = fetchViaOkHttp(url, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
-        if (plain != null) return plain
+        consider(fetchViaOkHttp(url, session))?.let { return it }
+
         if (token != null) {
             val tokUrl = withToken(url, token)
-            if (tokUrl != url) return fetchViaOkHttp(tokUrl, session)?.takeIf { normalizeSegment(it, session.xorKey) != null }
+            if (tokUrl != url) consider(fetchViaOkHttp(tokUrl, session))?.let { return it }
         }
-        return null
+
+        // Same _v7 path on the fetch host often serves the PNG+XOR body that OkHttp
+        // can actually download (lock*.stronghole.site returns 403 to non-browser TLS).
+        if (path != null && path.startsWith("/_v7/") && !host.contains("flixcloud")) {
+            val fetchUrl = if (token != null) {
+                "https://fetch.flixcloud.cc$path?token=$token"
+            } else {
+                "https://fetch.flixcloud.cc$path"
+            }
+            consider(fetchViaOkHttp(fetchUrl, session))?.let { return it }
+        }
+
+        val wv = runBlocking {
+            WebViewSegmentFetcher.fetchBytes(url, session.embedUrl ?: "https://flixcloud.cc/")
+        }
+        consider(wv)?.let {
+            Log.i(TAG, "webview segment ok len=${it.size} from ${url.substringBefore('?').take(80)}")
+            return it
+        }
+
+        val leftover = lastRaw
+        if (leftover != null) {
+            Log.w(
+                TAG,
+                "no source produced valid media; returning last raw len=${leftover.size} " +
+                    "head=${leftover.take(4).joinToString("") { "%02x".format(it) }}"
+            )
+        }
+        return leftover
     }
 
     /** Append `token=...` to [url] if it does not already carry a token. */
@@ -446,28 +444,28 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Recover real MPEG-TS / fMP4 from FlixCloud image-disguised (and optionally
-     * XOR-wrapped) segment bodies. Returns null if nothing validates — never
-     * feed ExoPlayer a false-positive "TS" (that causes Encoding error).
+     * Recover real MPEG-TS / fMP4 / packed ADTS from FlixCloud image-disguised
+     * (and optionally XOR-wrapped) segment bodies. Returns null if nothing
+     * validates — never feed ExoPlayer a false-positive "TS".
      */
     private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
-        // Order matters: strip any leading image magic FIRST so the XOR key aligns
-        // with the payload, then XOR, then validate TS. XORing the un-stripped
-        // buffer shifts the key by the header length and hides the 0x47 syncs.
+        // The XOR key must stay aligned with the TS payload. Walking 0x00/0xFF
+        // "padding" after the 8-byte PNG signature used to shift the key whenever
+        // the first XOR'd byte happened to be 0x00 or 0xFF (0x47 xor key[0]).
+        val views = ArrayList<ByteArray>(4)
+        views.add(raw)
         val stripped = stripImageContainer(raw)
-
-        // 1) raw body (no header) as-is
-        extractMedia(stripped)?.let { return it }
-
-        // 2) raw body XOR'd with the key (TS is XOR-obfuscated with a repeating key)
-        if (xorKey != null && xorKey.isNotEmpty()) {
-            extractMedia(xorBytes(stripped, xorKey))?.let { return it }
+        if (stripped !== raw) views.add(stripped)
+        if ((isPngMagic(raw) || isRiffMagic(raw)) && raw.size > 8) {
+            val exact = raw.copyOfRange(8, raw.size)
+            if (stripped !== exact) views.add(exact)
         }
 
-        // 3) XOR the whole buffer, then strip the (now decrypted) header
-        if (xorKey != null && xorKey.isNotEmpty()) {
-            val xored = xorBytes(raw, xorKey)
-            extractMedia(stripImageContainer(xored))?.let { return it }
+        for (view in views) {
+            extractMedia(view)?.let { return it }
+            if (xorKey != null && xorKey.isNotEmpty()) {
+                extractMedia(xorBytes(view, xorKey))?.let { return it }
+            }
         }
         return null
     }
@@ -475,18 +473,10 @@ object LocalPlaylistServer {
     private fun extractMedia(data: ByteArray): ByteArray? {
         if (strictTs(data)) return data
         if (looksLikeFmp4(data)) return data
+        if (looksLikeAdts(data)) return data
         findStrictTsStart(data)?.let { start ->
             val sliced = if (start == 0) data else data.copyOfRange(start, data.size)
             if (strictTs(sliced)) return sliced
-        }
-        val stripped = stripImageContainer(data)
-        if (stripped !== data) {
-            if (strictTs(stripped)) return stripped
-            if (looksLikeFmp4(stripped)) return stripped
-            findStrictTsStart(stripped)?.let { start ->
-                val sliced = if (start == 0) stripped else stripped.copyOfRange(start, stripped.size)
-                if (strictTs(sliced)) return sliced
-            }
         }
         return null
     }
@@ -560,46 +550,53 @@ object LocalPlaylistServer {
         return null
     }
 
+    private fun isPngMagic(data: ByteArray): Boolean =
+        data.size >= 4 &&
+            data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
+            data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
+
+    private fun isRiffMagic(data: ByteArray): Boolean =
+        data.size >= 4 &&
+            data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
+            data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
+
+    /** Real PNG starts with an IHDR chunk (length 13) immediately after the signature. */
+    private fun isRealPng(data: ByteArray): Boolean =
+        data.size >= 16 &&
+            data[8] == 0x00.toByte() && data[9] == 0x00.toByte() &&
+            data[10] == 0x00.toByte() && data[11] == 0x0D.toByte() &&
+            data[12] == 0x49.toByte() && data[13] == 0x48.toByte() &&
+            data[14] == 0x44.toByte() && data[15] == 0x52.toByte()
+
+    private fun isRealRiff(data: ByteArray): Boolean {
+        if (data.size < 12) return false
+        val form = String(data, 8, 4, Charsets.US_ASCII)
+        return form == "WEBP" || form == "WAVE" || form == "AVI "
+    }
+
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
-        // PNG magic (no real chunk/length structure — just a signature prefix
-        // followed by the obfuscated payload). Strip the 8-byte signature + padding.
-        if (data[0] == 0x89.toByte() && data[1] == 0x50.toByte() &&
-            data[2] == 0x4E.toByte() && data[3] == 0x47.toByte()
-        ) {
-            // Prefer real IEND boundary if present (payload appended after the image).
-            val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
-            if (iend >= 0) {
-                var start = iend + 8
-                while (start < data.size &&
-                    (data[start] == 0xFF.toByte() || data[start] == 0x00.toByte())
-                ) {
-                    start++
+        if (isPngMagic(data)) {
+            // Only search for IEND in a real PNG. XOR'd TS after a fake 8-byte
+            // signature can coincidentally contain "IEND" and would slice wrong.
+            if (isRealPng(data)) {
+                val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
+                if (iend >= 0 && iend + 8 < data.size) {
+                    return data.copyOfRange(iend + 8, data.size)
                 }
-                if (start < data.size) return data.copyOfRange(start, data.size)
             }
-            // No IEND: this is a bare image-magic prefix. Skip the 8-byte PNG
-            // signature (89 50 4E 47 0D 0A 1A 0A) and any trailing zeros/padding.
-            var start = 8
-            while (start < data.size &&
-                (data[start] == 0x00.toByte() || data[start] == 0xFF.toByte())
-            ) {
-                start++
-            }
-            if (start < data.size) return data.copyOfRange(start, data.size)
+            return data.copyOfRange(8, data.size)
         }
-        // RIFF / WEBP — payload after full RIFF chunk
-        if (data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
-            data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
-        ) {
-            val riffSize = (data[4].toInt() and 0xff) or
-                ((data[5].toInt() and 0xff) shl 8) or
-                ((data[6].toInt() and 0xff) shl 16) or
-                ((data[7].toInt() and 0xff) shl 24)
-            val after = 8 + riffSize
-            if (after in 1 until data.size) return data.copyOfRange(after, data.size)
-            // If the RIFF length looks bogus/huge, fall back to skipping the 8-byte header.
-            if (after >= data.size && data.size > 8) return data.copyOfRange(8, data.size)
+        if (isRiffMagic(data)) {
+            if (isRealRiff(data)) {
+                val riffSize = (data[4].toInt() and 0xff) or
+                    ((data[5].toInt() and 0xff) shl 8) or
+                    ((data[6].toInt() and 0xff) shl 16) or
+                    ((data[7].toInt() and 0xff) shl 24)
+                val after = 8 + riffSize
+                if (after in 1 until data.size) return data.copyOfRange(after, data.size)
+            }
+            return data.copyOfRange(8, data.size)
         }
         return data
     }
@@ -623,6 +620,18 @@ object LocalPlaylistServer {
         if (data.size < 8) return false
         val box = String(data, 4, minOf(4, data.size - 4), Charsets.US_ASCII)
         return box == "ftyp" || box == "moof" || box == "mdat" || box == "styp"
+    }
+
+    /** Packed-audio HLS (ADTS AAC) used by some audio rendition groups. */
+    private fun looksLikeAdts(data: ByteArray): Boolean {
+        if (data.size < 64) return false
+        val b0 = data[0].toInt() and 0xFF
+        val b1 = data[1].toInt() and 0xFF
+        if (b0 != 0xFF || (b1 and 0xF6) != 0xF0) return false
+        val frameLen = ((b1 and 0x03) shl 11) or
+            ((data[2].toInt() and 0xFF) shl 3) or
+            ((data[3].toInt() and 0xFF) ushr 5)
+        return frameLen in 7..data.size
     }
 
     private fun findStrictTsStart(data: ByteArray, from: Int = 0): Int? {

@@ -44,82 +44,98 @@ object WebViewSegmentFetcher {
     /** Fetch [url] through the WebView. Returns raw bytes or null on failure/timeout. */
     suspend fun fetchBytes(url: String, embedUrl: String): ByteArray? = mutex.withLock {
         try {
-            // 1) create WebView on the main thread
             val created = Unit.mainWork { ensureWebView() }
             if (!created) {
                 Log.w(TAG, "webview creation failed")
                 return@withLock null
             }
 
-            // 2) prime the flixcloud embed page and STAY on it. The real player runs
-            //    from flixcloud.cc and its hls.js fetches vault segments cross-origin
-            //    with Origin=flixcloud.cc + credentials (the embed page preloads
-            //    vault94 subtitles/fonts, which sets the vault cf_clearance cookie).
-            //    So we must keep Origin=flixcloud.cc (NOT navigate to the vault host)
-            //    and send credentials so that cookie flows.
-            if (primedEmbed != embedUrl) {
-                val ok = primeUrl(embedUrl)
-                Log.i(TAG, "embed prime ${if (ok) "ok" else "failed/timed out"}")
-                primedEmbed = embedUrl
-                // give the embed page time to preload vault resources (sets cf_clearance)
-                delay(2000)
+            val origin = try {
+                val u = java.net.URL(url)
+                "${u.protocol}://${u.host}/"
+            } catch (_: Exception) {
+                embedUrl
             }
 
-            // 3) start the fetch script (sets window.__fcState + window.__fcParts)
-            val started = Unit.mainWork {
-                try {
-                    val wv = webView ?: return@mainWork false
-                    wv.evaluateJavascript(buildScript(url), null)
-                    true
-                } catch (e: Exception) {
-                    Log.w(TAG, "evaluateJavascript failed: ${e.message}")
-                    false
-                }
-            }
-            if (!started) return@withLock null
+            // Same-origin prime: fetch() from the segment host avoids CORS, and
+            // credentials:include sends cf_clearance. Cross-origin fetch from the
+            // flixcloud embed page fails with "Failed to fetch" on rotating CDNs.
+            runFetch(url, origin, credentialsInclude = true)?.let { return@withLock it }
 
-            // 5) poll window.__fcState until it resolves
-            delay(300) // let the script start before polling
-            val deadline = System.currentTimeMillis() + FETCH_TIMEOUT_MS
-            var lastState = "none"
-            while (System.currentTimeMillis() < deadline) {
-                val state = pollState()
-                if (state == null) {
-                    delay(POLL_INTERVAL_MS)
-                    continue
-                }
-                if (state == "P") {
-                    lastState = "pending"
-                    delay(POLL_INTERVAL_MS)
-                    continue
-                }
-                if (state.startsWith("OK:")) {
-                    val partCount = state.removePrefix("OK:").toIntOrNull()
-                    val b64 = if (partCount != null && partCount > 0) readParts(partCount) else null
-                    if (b64 != null) {
-                        val bytes = runCatching {
-                            android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                        }.getOrNull()
-                        if (bytes != null && bytes.isNotEmpty()) {
-                            Log.i(TAG, "webview fetch ok ${bytes.size}b for ${url.take(90)}")
-                            return@withLock bytes
-                        }
-                        Log.w(TAG, "webview base64 decode failed len=${b64.length} for ${url.take(90)}")
-                    } else {
-                        Log.w(TAG, "webview parts read failed for ${url.take(90)}")
-                    }
-                    return@withLock null
-                }
-                lastState = state.take(140)
-                Log.w(TAG, "webview script state: $lastState for ${url.take(90)}")
-                return@withLock null
+            if (!origin.equals(embedUrl, ignoreCase = true) &&
+                !embedUrl.startsWith(origin)
+            ) {
+                Log.i(TAG, "same-origin fetch failed, retrying from embed origin")
+                runFetch(url, embedUrl, credentialsInclude = false)?.let { return@withLock it }
             }
-            Log.w(TAG, "webview fetch timed out, lastState=$lastState for ${url.take(90)}")
             null
         } catch (e: Exception) {
             Log.w(TAG, "webview fetch exception: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
+    }
+
+    private suspend fun runFetch(
+        url: String,
+        primePage: String,
+        credentialsInclude: Boolean
+    ): ByteArray? {
+        if (primedEmbed != primePage) {
+            val ok = primeUrl(primePage)
+            Log.i(TAG, "prime $primePage ${if (ok) "ok" else "failed/timed out"}")
+            primedEmbed = primePage
+            delay(2000)
+        }
+
+        val started = Unit.mainWork {
+            try {
+                val wv = webView ?: return@mainWork false
+                wv.evaluateJavascript(buildScript(url, credentialsInclude), null)
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "evaluateJavascript failed: ${e.message}")
+                false
+            }
+        }
+        if (!started) return null
+
+        delay(300)
+        val deadline = System.currentTimeMillis() + FETCH_TIMEOUT_MS
+        var lastState = "none"
+        while (System.currentTimeMillis() < deadline) {
+            val state = pollState()
+            if (state == null) {
+                delay(POLL_INTERVAL_MS)
+                continue
+            }
+            if (state == "P") {
+                lastState = "pending"
+                delay(POLL_INTERVAL_MS)
+                continue
+            }
+            if (state.startsWith("OK:")) {
+                val partCount = state.removePrefix("OK:").toIntOrNull()
+                val b64 = if (partCount != null && partCount > 0) readParts(partCount) else null
+                if (b64 != null) {
+                    val bytes = runCatching {
+                        android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                    }.getOrNull()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        Log.i(TAG, "webview fetch ok ${bytes.size}b for ${url.take(90)}")
+                        return bytes
+                    }
+                    Log.w(TAG, "webview base64 decode failed len=${b64.length} for ${url.take(90)}")
+                } else {
+                    Log.w(TAG, "webview parts read failed for ${url.take(90)}")
+                }
+                return null
+            }
+            lastState = state.take(140)
+            Log.w(TAG, "webview script state: $lastState for ${url.take(90)}")
+            return null
+        }
+        Log.w(TAG, "webview fetch timed out, lastState=$lastState for ${url.take(90)}")
+        return null
     }
 
     /** Read the current window.__fcState string from the WebView. */
@@ -205,8 +221,12 @@ object WebViewSegmentFetcher {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
+                settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 webViewClient = WebViewClient()
             }
+            val cookies = android.webkit.CookieManager.getInstance()
+            cookies.setAcceptCookie(true)
+            cookies.setAcceptThirdPartyCookies(wv, true)
             webView = wv
             Log.i(TAG, "webview created")
             true
@@ -216,18 +236,15 @@ object WebViewSegmentFetcher {
         }
     }
 
-    private fun buildScript(url: String): String {
+    private fun buildScript(url: String, credentialsInclude: Boolean): String {
         val quoted = url.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        val creds = if (credentialsInclude) "include" else "omit"
         return """
         (function() {
           window.__fcState = 'P';
           window.__fcParts = [];
           var url = '$quoted';
-          // The page is primed on the segment host, so same-origin fetches can and
-          // MUST include cookies (cf_clearance) — without them the vault CDN returns
-          // a poisoned WEBP ("RIFF") instead of real TS. Cross-origin fetches keep
-          // omit, because ACAO: * rejects credentialed cross-origin requests.
-          fetch(url, { credentials: 'omit', mode: 'cors' }).then(function(r) {
+          fetch(url, { credentials: '$creds', mode: 'cors' }).then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.arrayBuffer();
           }).then(function(buf) {
@@ -238,8 +255,6 @@ object WebViewSegmentFetcher {
               bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CH, bytes.length)));
             }
             var b64 = btoa(bin);
-            // Keep chunks small: evaluateJavascript result callbacks silently drop
-            // very large strings, which made readParts fail for big (3MB+) segments.
             var CHUNK = 200000;
             window.__fcParts = [];
             for (var i = 0; i < b64.length; i += CHUNK) {
