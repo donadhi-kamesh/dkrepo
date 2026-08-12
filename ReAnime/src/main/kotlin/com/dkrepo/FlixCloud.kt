@@ -391,6 +391,12 @@ class FlixCloud : ExtractorApi() {
      */
     private fun slimMaster(master: String, baseUrl: String): String {
         val best = extractBestVariant(master, baseUrl) ?: return master
+        val keepAudio = master.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("#EXT-X-MEDIA") && it.contains("TYPE=AUDIO") }
+            .let { audios ->
+                audios.firstOrNull { it.contains("DEFAULT=YES") } ?: audios.firstOrNull()
+            }
         val lines = master.lines()
         val out = ArrayList<String>(lines.size)
         var i = 0
@@ -399,6 +405,13 @@ class FlixCloud : ExtractorApi() {
             val l = raw.trim()
             when {
                 l.startsWith("#EXT-X-I-FRAME-STREAM-INF") -> i++
+                l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") -> {
+                    if (keepAudio != null && l != keepAudio) i++
+                    else {
+                        out.add(raw)
+                        i++
+                    }
+                }
                 l.startsWith("#EXT-X-STREAM-INF") -> {
                     val next = lines.getOrNull(i + 1)?.trim()
                     val abs = if (!next.isNullOrEmpty() && !next.startsWith("#")) {
