@@ -10,10 +10,8 @@ import java.net.URLDecoder
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
@@ -35,13 +33,7 @@ object LocalPlaylistServer {
     private val segmentCache = ConcurrentHashMap<String, ByteArray>()
     private val playlistBodyCache = ConcurrentHashMap<String, ByteArray>()
     private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
-    private val fetchJobs = PriorityBlockingQueue<FetchJob>()
-    private val jobSeq = AtomicLong()
-    private val lowInFlight = AtomicInteger(0)
-
-    @Volatile private var audioHead = -1
-    @Volatile private var videoHead = -1
-    @Volatile private var workersStarted = false
+    private val cdnPermits = Semaphore(3)
 
     /**
      * Own OkHttp client so preview/catalog traffic on Cloudstream's shared
@@ -49,32 +41,18 @@ object LocalPlaylistServer {
      */
     private val httpClient: OkHttpClient by lazy {
         val dispatcher = Dispatcher().apply {
-            maxRequests = 4
-            maxRequestsPerHost = 4
+            maxRequests = 3
+            maxRequestsPerHost = 3
         }
         OkHttpClient.Builder()
             .dispatcher(dispatcher)
-            .connectionPool(ConnectionPool(4, 5, TimeUnit.MINUTES))
+            .connectionPool(ConnectionPool(3, 5, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
-    }
-
-    private class FetchJob(
-        val priority: Int,
-        val seq: Long,
-        val url: String,
-        val session: Session,
-        val future: CompletableFuture<ByteArray?>
-    ) : Comparable<FetchJob> {
-        override fun compareTo(other: FetchJob): Int {
-            val p = priority.compareTo(other.priority)
-            if (p != 0) return p
-            return seq.compareTo(other.seq)
-        }
     }
 
     /**
@@ -120,44 +98,8 @@ object LocalPlaylistServer {
                 }
             }
         }
-        startFetchWorkers()
         Log.i(TAG, "listening on 127.0.0.1:$port")
         return port
-    }
-
-    private fun startFetchWorkers() {
-        if (workersStarted) return
-        workersStarted = true
-        repeat(2) { i ->
-            thread(isDaemon = true, name = "FlixCloud-CDN-$i") {
-                while (true) {
-                    val job = try {
-                        fetchJobs.take()
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                    if (job.future.isDone) continue
-                    val low = job.priority > 0
-                    if (low) {
-                        if (lowInFlight.get() >= 1 && fetchJobs.any { it.priority == 0 }) {
-                            fetchJobs.put(job)
-                            try { Thread.sleep(25) } catch (_: InterruptedException) { break }
-                            continue
-                        }
-                        lowInFlight.incrementAndGet()
-                    }
-                    try {
-                        if (!job.future.isDone) {
-                            job.future.complete(fetchViaOkHttp(job.url, job.session))
-                        }
-                    } catch (e: Exception) {
-                        job.future.completeExceptionally(e)
-                    } finally {
-                        if (low) lowInFlight.decrementAndGet()
-                    }
-                }
-            }
-        }
     }
 
     fun publish(
@@ -169,8 +111,6 @@ object LocalPlaylistServer {
         embedUrl: String? = null
     ): String {
         val p = ensureStarted()
-        audioHead = -1
-        videoHead = -1
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         val rewritten = rewritePlaylist(body, sessionId, p, prefetchPlaylists = false)
@@ -480,8 +420,6 @@ object LocalPlaylistServer {
                 else -> "video/mp2t"
             }
             writeResponse(out, 200, mime, cached, cache = true)
-            markServed(remote)
-            prefetchAhead(remote, session)
             return
         }
         // A referenced *.m3u8 is itself a media/variant playlist that ExoPlayer
@@ -531,14 +469,12 @@ object LocalPlaylistServer {
                     "from ${remote.substringBefore('?').take(80)}"
             )
             rememberSegment(remote, cleaned)
-            markServed(remote)
             try {
                 writeResponse(out, 200, mime, cleaned, cache = true)
             } catch (e: Exception) {
                 Log.w(TAG, "client gone after fetch: ${e.message}")
             }
             trimMaps()
-            prefetchAhead(remote, session)
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             try { writeResponse(out, 502, "text/plain", ByteArray(0)) } catch (_: Exception) {}
@@ -564,29 +500,6 @@ object LocalPlaylistServer {
         if (path != null) segmentCache["https://fetch.flixcloud.cc$path"] = cleaned
     }
 
-    private fun segNumber(url: String): Int? =
-        Regex("seg-(\\d+)").find(url)?.groupValues?.get(1)?.toIntOrNull()
-
-    /** Playback (audio + nearby video) beats Cloudstream's PreviewImgM3u8 samples. */
-    private fun fetchPriority(url: String): Int {
-        val n = segNumber(url) ?: return 1
-        if (url.contains("/audio/")) return 0
-        if (audioHead >= 0 && kotlin.math.abs(n - audioHead) <= 4) return 0
-        if (videoHead >= 0 && n in (videoHead - 1)..(videoHead + 6)) return 0
-        return 2
-    }
-
-    private fun markServed(url: String) {
-        val n = segNumber(url) ?: return
-        if (url.contains("/audio/")) {
-            audioHead = n
-        } else if (audioHead >= 0 && kotlin.math.abs(n - audioHead) <= 4) {
-            videoHead = n
-        } else if (videoHead < 0) {
-            videoHead = n
-        }
-    }
-
     /**
      * Vault/lock/rundown CDN hosts 403 OkHttp. The working path is always
      * fetch.flixcloud.cc + JWT. Skip the 403 round-trips and skip WebView.
@@ -600,51 +513,38 @@ object LocalPlaylistServer {
         return if (!token.isNullOrEmpty()) withToken(base, token) else base
     }
 
-    private fun fetchBytes(url: String, session: Session, priority: Int = fetchPriority(url)): ByteArray? {
+    private fun fetchBytes(url: String, session: Session): ByteArray? {
         val token = session.segmentReferer
             ?.substringAfter("token=", "")
             ?.takeIf { it.isNotEmpty() }
         val primary = v7FetchUrl(url, token)
-        Log.i(TAG, "fetchBytes p=$priority ${primary.substringBefore('?').take(100)}")
+        Log.i(TAG, "fetchBytes ${primary.substringBefore('?').take(100)}")
 
-        val future = inflight.computeIfAbsent(primary) { key ->
-            val f = CompletableFuture<ByteArray?>()
-            fetchJobs.put(
-                FetchJob(
-                    priority = priority,
-                    seq = jobSeq.incrementAndGet(),
-                    url = key,
-                    session = session,
-                    future = f
-                )
-            )
-            f.whenComplete { _, _ -> inflight.remove(key, f) }
-            f
+        val created = CompletableFuture<ByteArray?>()
+        val existing = inflight.putIfAbsent(primary, created)
+        if (existing != null) {
+            return try {
+                existing.get(20, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                Log.w(TAG, "fetchBytes wait failed: ${e.message}")
+                null
+            }
         }
         return try {
-            future.get(25, TimeUnit.SECONDS)
-        } catch (e: Exception) {
-            Log.w(TAG, "fetchBytes wait failed: ${e.message}")
-            null
-        }
-    }
-
-    private fun prefetchAhead(remote: String, session: Session) {
-        if (fetchPriority(remote) != 0) return
-        val n = segNumber(remote) ?: return
-        if (fetchJobs.size > 3) return
-        thread(isDaemon = true, name = "FlixCloud-Prefetch") {
-            for (delta in 1..2) {
-                val next = remote.replaceFirst("seg-$n", "seg-${n + delta}")
-                if (cachedSegment(next) != null) continue
-                try {
-                    val raw = fetchBytes(next, session, priority = 3) ?: continue
-                    val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
-                    rememberSegment(next, cleaned)
-                } catch (_: Exception) {
-                }
+            cdnPermits.acquire()
+            try {
+                val bytes = fetchViaOkHttp(primary, session)
+                created.complete(bytes)
+                bytes
+            } finally {
+                cdnPermits.release()
             }
-            trimMaps()
+        } catch (e: Exception) {
+            created.completeExceptionally(e)
+            Log.w(TAG, "fetchBytes failed: ${e.message}")
+            null
+        } finally {
+            inflight.remove(primary, created)
         }
     }
 
