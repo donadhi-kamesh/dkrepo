@@ -55,12 +55,14 @@ object LocalPlaylistServer {
     // In-flight deduplication
     private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
 
-    // Playback state and generation counter for instant prefetch cancellation on seek
-    private val playHead = AtomicInteger(-1)
-    private val prefetchGeneration = AtomicInteger(0)
+    // Independent playhead and generation tracking for Video and Audio lanes
+    private val playHeadVideo = AtomicInteger(-1)
+    private val playHeadAudio = AtomicInteger(-1)
+    private val videoPrefetchGen = AtomicInteger(0)
+    private val audioPrefetchGen = AtomicInteger(0)
 
-    // Thread pool for prefetching upcoming segments in parallel
-    private val prefetchPool = Executors.newFixedThreadPool(4) { r ->
+    // 2-thread pool: 1 lane for sequential video prefetch, 1 lane for sequential audio prefetch
+    private val prefetchPool = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "FlixCloud-Prefetch").apply { isDaemon = true }
     }
 
@@ -73,19 +75,21 @@ object LocalPlaylistServer {
     private val workingExtByDir = ConcurrentHashMap<String, String>()
 
     /**
-     * Dedicated OkHttpClient configured with high connection limits and connection reuse.
+     * Dedicated OkHttpClient configured with high connection limits, connection reuse,
+     * and retry capability.
      */
     private val httpClient: OkHttpClient by lazy {
         val dispatcher = Dispatcher().apply {
-            maxRequests = 32
+            maxRequests = 16
             maxRequestsPerHost = 16
         }
         OkHttpClient.Builder()
             .dispatcher(dispatcher)
             .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
@@ -149,8 +153,10 @@ object LocalPlaylistServer {
         embedUrl: String? = null
     ): String {
         val p = ensureStarted()
-        playHead.set(-1)
-        prefetchGeneration.incrementAndGet()
+        playHeadVideo.set(-1)
+        playHeadAudio.set(-1)
+        videoPrefetchGen.incrementAndGet()
+        audioPrefetchGen.incrementAndGet()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         val rewritten = rewritePlaylist(body, sessionId, p)
@@ -506,7 +512,7 @@ object LocalPlaylistServer {
         // Deduplicate in-flight requests (attach to running future)
         inflight[primary]?.let { existing ->
             return try {
-                existing.get(20, TimeUnit.SECONDS)
+                existing.get(25, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 Log.w(TAG, "fetchBytes wait failed: ${e.message}")
                 null
@@ -517,7 +523,7 @@ object LocalPlaylistServer {
         val existing = inflight.putIfAbsent(primary, created)
         if (existing != null) {
             return try {
-                existing.get(20, TimeUnit.SECONDS)
+                existing.get(25, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 Log.w(TAG, "fetchBytes wait failed: ${e.message}")
                 null
@@ -596,41 +602,59 @@ object LocalPlaylistServer {
     private fun segNumber(url: String): Int? =
         Regex("seg-(\\d+)").find(url)?.groupValues?.get(1)?.toIntOrNull()
 
+    private fun nextSegmentUrl(url: String, targetSeg: Int): String =
+        url.replaceFirst(Regex("seg-\\d+"), "seg-$targetSeg")
+
     /**
      * Called whenever a segment is actively played/requested by ExoPlayer.
-     * Updates playHead and triggers parallel prefetch of upcoming segments.
+     * Updates playHead and triggers sequential background prefetching ahead.
      */
     private fun onSegmentPlayed(url: String, session: Session) {
         val n = segNumber(url) ?: return
-        val prev = playHead.getAndSet(n)
-        if (prev >= 0 && kotlin.math.abs(n - prev) > 4) {
-            // User seeked: cancel older prefetch tasks
-            prefetchGeneration.incrementAndGet()
+        val isAudio = url.contains("/audio/")
+        val headRef = if (isAudio) playHeadAudio else playHeadVideo
+        val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+
+        headRef.set(n)
+        val gen = genRef.incrementAndGet()
+
+        prefetchPool.execute {
+            runPrefetchLoop(url, session, n, isAudio, gen)
         }
-        prefetchAhead(url, session, n)
     }
 
     /**
-     * Prefetches upcoming segments in parallel using the prefetch thread pool.
+     * Sequentially prefetches upcoming segments (1 at a time) to keep 3-4 segments (~10s)
+     * of buffer ready in cache without overwhelming the CDN or network.
      */
-    private fun prefetchAhead(remote: String, session: Session, currentSeg: Int) {
-        val currentGen = prefetchGeneration.get()
-        val lookaheadCount = if (remote.contains("/audio/")) 4 else 5
+    private fun runPrefetchLoop(
+        baseUrl: String,
+        session: Session,
+        currentSeg: Int,
+        isAudio: Boolean,
+        gen: Int
+    ) {
+        val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+        val maxLookahead = if (isAudio) 4 else 3
 
-        for (delta in 1..lookaheadCount) {
+        for (delta in 1..maxLookahead) {
+            if (genRef.get() != gen) return // Abort if seeked or playhead moved
+
             val targetSeg = currentSeg + delta
-            val nextUrl = remote.replaceFirst("seg-$currentSeg", "seg-$targetSeg")
+            val nextUrl = nextSegmentUrl(baseUrl, targetSeg)
+
             if (cachedSegment(nextUrl) != null) continue
 
-            prefetchPool.execute {
-                if (prefetchGeneration.get() != currentGen) return@execute
-                try {
-                    val raw = fetchBytes(nextUrl, session, isPrefetch = true) ?: return@execute
-                    if (prefetchGeneration.get() != currentGen) return@execute
-                    val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
-                    rememberSegment(nextUrl, cleaned)
-                } catch (_: Exception) {
-                }
+            try {
+                val raw = fetchBytes(nextUrl, session, isPrefetch = true) ?: continue
+                if (genRef.get() != gen) return
+                val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
+                rememberSegment(nextUrl, cleaned)
+                Log.i(
+                    TAG,
+                    "prefetched seg-$targetSeg (${if (isAudio) "audio" else "video"}) ${cleaned.size}b"
+                )
+            } catch (_: Exception) {
             }
         }
     }
