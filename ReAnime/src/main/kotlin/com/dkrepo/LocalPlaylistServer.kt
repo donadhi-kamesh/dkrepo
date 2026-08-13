@@ -34,6 +34,8 @@ object LocalPlaylistServer {
     private val playlistBodyCache = ConcurrentHashMap<String, ByteArray>()
     private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
     private val cdnPermits = Semaphore(3)
+    /** Last CDN disguise that returned 200, keyed by directory (`.../_v7/uuid` vs `.../audio`). */
+    private val workingExtByDir = ConcurrentHashMap<String, String>()
 
     /**
      * Own OkHttp client so preview/catalog traffic on Cloudstream's shared
@@ -533,7 +535,14 @@ object LocalPlaylistServer {
         return try {
             cdnPermits.acquire()
             try {
-                val bytes = fetchViaOkHttp(primary, session)
+                var bytes: ByteArray? = null
+                for (candidate in segmentUrlVariants(primary)) {
+                    bytes = fetchViaOkHttp(candidate, session)
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        rememberWorkingExt(candidate)
+                        break
+                    }
+                }
                 created.complete(bytes)
                 bytes
             } finally {
@@ -552,6 +561,47 @@ object LocalPlaylistServer {
     private fun withToken(url: String, token: String): String {
         if (url.contains("token=")) return url
         return if (url.contains('?')) "$url&token=$token" else "$url?token=$token"
+    }
+
+    /**
+     * Playlists list fake extensions (.ttf/.woff/...). fetch.flixcloud.cc often 404s
+     * those and only serves the real disguise (.webp/.png). Try known-good first.
+     */
+    private val SEGMENT_EXTS = listOf(".webp", ".png", "", ".jpg", ".gif", ".woff2", ".woff", ".ttf")
+
+    private fun pathExt(url: String): String {
+        val name = url.substringBefore('?').substringAfterLast('/')
+        val dot = name.lastIndexOf('.')
+        return if (dot > 0) name.substring(dot) else ""
+    }
+
+    private fun dirKey(url: String): String =
+        url.substringBefore('?').substringBeforeLast('/')
+
+    private fun replaceExt(url: String, ext: String): String {
+        val noQuery = url.substringBefore('?')
+        val query = url.substringAfter('?', "")
+        val name = noQuery.substringAfterLast('/')
+        val dir = noQuery.substringBeforeLast('/', missingDelimiterValue = "")
+        val dot = name.lastIndexOf('.')
+        val stem = if (dot > 0) name.substring(0, dot) else name
+        val next = if (dir.isEmpty()) stem + ext else "$dir/$stem$ext"
+        return if (query.isEmpty()) next else "$next?$query"
+    }
+
+    private fun rememberWorkingExt(url: String) {
+        workingExtByDir[dirKey(url)] = pathExt(url)
+    }
+
+    private fun segmentUrlVariants(url: String): List<String> {
+        val out = ArrayList<String>(SEGMENT_EXTS.size + 2)
+        fun add(u: String) {
+            if (out.none { it == u }) out.add(u)
+        }
+        workingExtByDir[dirKey(url)]?.let { add(replaceExt(url, it)) }
+        add(url)
+        for (ext in SEGMENT_EXTS) add(replaceExt(url, ext))
+        return out
     }
 
     /** Dedicated OkHttp fetch — not Cloudstream's shared NiceHttp client. */
