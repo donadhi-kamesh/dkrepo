@@ -15,6 +15,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
@@ -52,7 +53,7 @@ object LocalPlaylistServer {
     private val segmentCache = BoundedLruCache<String, ByteArray>(32)
     private val playlistBodyCache = BoundedLruCache<String, ByteArray>(16)
 
-    // In-flight deduplication
+    // In-flight deduplication keyed by canonical segment identity
     private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
 
     // Independent playhead and generation tracking for Video and Audio lanes
@@ -60,6 +61,12 @@ object LocalPlaylistServer {
     private val playHeadAudio = AtomicInteger(-1)
     private val videoPrefetchGen = AtomicInteger(0)
     private val audioPrefetchGen = AtomicInteger(0)
+
+    @Volatile
+    private var activeVideoPrefetchCall: Call? = null
+
+    @Volatile
+    private var activeAudioPrefetchCall: Call? = null
 
     // 2-thread pool: 1 lane for sequential video prefetch, 1 lane for sequential audio prefetch
     private val prefetchPool = Executors.newFixedThreadPool(2) { r ->
@@ -157,6 +164,8 @@ object LocalPlaylistServer {
         playHeadAudio.set(-1)
         videoPrefetchGen.incrementAndGet()
         audioPrefetchGen.incrementAndGet()
+        activeVideoPrefetchCall?.cancel()
+        activeAudioPrefetchCall?.cancel()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         val rewritten = rewritePlaylist(body, sessionId, p)
@@ -297,7 +306,7 @@ object LocalPlaylistServer {
      * Serve a media/variant playlist back to ExoPlayer.
      */
     private fun servePlaylist(remote: String, session: Session, sessionId: String, out: java.io.OutputStream) {
-        val cacheKey = canonicalKey(remote)
+        val cacheKey = segmentIdentityKey(remote)
         playlistBodyCache.get(cacheKey)?.let { cached ->
             writeResponse(out, 200, "application/vnd.apple.mpegurl", cached, cache = true)
             return
@@ -407,7 +416,7 @@ object LocalPlaylistServer {
             return
         }
 
-        // Return cached segment immediately if available
+        // Return cached segment immediately if available (100% cache hit via canonical key)
         cachedSegment(remote)?.let { cached ->
             val mime = detectMimeType(cached)
             writeResponse(out, 200, mime, cached, cache = true)
@@ -475,18 +484,26 @@ object LocalPlaylistServer {
         else -> "video/mp2t"
     }
 
-    private fun canonicalKey(url: String): String {
+    /**
+     * Maps all variations of a segment (slopnet vs fetch, with/without fake .woff2, tokens)
+     * to a single canonical identity key.
+     */
+    private fun segmentIdentityKey(url: String): String {
         val rewritten = rewriteCdnHost(url)
         val noQuery = rewritten.substringBefore('?')
-        return runCatching { java.net.URL(noQuery).path }.getOrNull() ?: noQuery
+        val path = runCatching { java.net.URL(noQuery).path }.getOrNull() ?: noQuery
+        val isAudio = path.contains("/audio/")
+        val dir = path.substringBeforeLast('/')
+        val segNum = Regex("seg-(\\d+)").find(path)?.groupValues?.get(1) ?: return path
+        return if (isAudio) "$dir/audio/seg-$segNum" else "$dir/seg-$segNum"
     }
 
     private fun cachedSegment(remote: String): ByteArray? {
-        return segmentCache.get(canonicalKey(remote))
+        return segmentCache.get(segmentIdentityKey(remote))
     }
 
     private fun rememberSegment(remote: String, cleaned: ByteArray) {
-        segmentCache.put(canonicalKey(remote), cleaned)
+        segmentCache.put(segmentIdentityKey(remote), cleaned)
     }
 
     /**
@@ -502,15 +519,23 @@ object LocalPlaylistServer {
         return if (!token.isNullOrEmpty()) withToken(base, token) else base
     }
 
-    private fun fetchBytes(url: String, session: Session, isPrefetch: Boolean = false): ByteArray? {
+    private fun fetchBytes(
+        url: String,
+        session: Session,
+        isPrefetch: Boolean = false,
+        prefetchGen: Int? = null,
+        isAudio: Boolean = false
+    ): ByteArray? {
         val token = session.segmentReferer
             ?.substringAfter("token=", "")
             ?.takeIf { it.isNotEmpty() }
         val primary = v7FetchUrl(url, token)
+        val identity = segmentIdentityKey(primary)
+
         if (!isPrefetch) Log.i(TAG, "fetchBytes ${primary.substringBefore('?').take(100)}")
 
-        // Deduplicate in-flight requests (attach to running future)
-        inflight[primary]?.let { existing ->
+        // Deduplicate in-flight requests using segmentIdentityKey
+        inflight[identity]?.let { existing ->
             return try {
                 existing.get(25, TimeUnit.SECONDS)
             } catch (e: Exception) {
@@ -520,7 +545,7 @@ object LocalPlaylistServer {
         }
 
         val created = CompletableFuture<ByteArray?>()
-        val existing = inflight.putIfAbsent(primary, created)
+        val existing = inflight.putIfAbsent(identity, created)
         if (existing != null) {
             return try {
                 existing.get(25, TimeUnit.SECONDS)
@@ -533,7 +558,13 @@ object LocalPlaylistServer {
         return try {
             var bytes: ByteArray? = null
             for (candidate in segmentUrlVariants(primary)) {
-                bytes = fetchViaOkHttp(candidate, session)
+                // Abort candidate search if prefetch generation was cancelled
+                if (prefetchGen != null) {
+                    val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+                    if (genRef.get() != prefetchGen) break
+                }
+
+                bytes = fetchViaOkHttp(candidate, session, isPrefetch, isAudio)
                 if (bytes != null && bytes.isNotEmpty()) {
                     rememberWorkingExt(candidate)
                     break
@@ -546,7 +577,7 @@ object LocalPlaylistServer {
             Log.w(TAG, "fetchBytes failed: ${e.message}")
             null
         } finally {
-            inflight.remove(primary, created)
+            inflight.remove(identity, created)
         }
     }
 
@@ -557,10 +588,9 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Playlists list fake extensions (.ttf/.woff/...). fetch.flixcloud.cc often 404s
-     * those and only serves the real disguise (.webp/.png). Try known-good first.
+     * Extensions to probe. Empty string (no extension) and .png / .webp are prioritised.
      */
-    private val SEGMENT_EXTS = listOf(".webp", ".png", "", ".jpg", ".gif", ".woff2", ".woff", ".ttf")
+    private val SEGMENT_EXTS = listOf("", ".png", ".webp", ".jpg", ".gif", ".woff2", ".woff", ".ttf")
 
     private fun pathExt(url: String): String {
         val name = url.substringBefore('?').substringAfterLast('/')
@@ -587,15 +617,20 @@ object LocalPlaylistServer {
     }
 
     private fun segmentUrlVariants(url: String): List<String> {
-        workingExtByDir[dirKey(url)]?.let { known ->
-            return listOf(replaceExt(url, known))
+        val dir = dirKey(url)
+        val known = workingExtByDir[dir]
+        val out = ArrayList<String>(SEGMENT_EXTS.size + 2)
+
+        if (known != null) {
+            out.add(replaceExt(url, known))
         }
-        val out = ArrayList<String>(SEGMENT_EXTS.size + 1)
-        fun add(u: String) {
-            if (out.none { it == u }) out.add(u)
+
+        for (ext in SEGMENT_EXTS) {
+            val candidate = replaceExt(url, ext)
+            if (!out.contains(candidate)) out.add(candidate)
         }
-        add(url)
-        for (ext in SEGMENT_EXTS) add(replaceExt(url, ext))
+
+        if (!out.contains(url)) out.add(url)
         return out
     }
 
@@ -607,7 +642,7 @@ object LocalPlaylistServer {
 
     /**
      * Called whenever a segment is actively played/requested by ExoPlayer.
-     * Updates playHead and triggers sequential background prefetching ahead.
+     * Updates playHead, increments generation, and cancels previous stale prefetch downloads.
      */
     private fun onSegmentPlayed(url: String, session: Session) {
         val n = segNumber(url) ?: return
@@ -617,6 +652,13 @@ object LocalPlaylistServer {
 
         headRef.set(n)
         val gen = genRef.incrementAndGet()
+
+        // Instantly cancel ongoing prefetch HTTP calls on seek or advance
+        if (isAudio) {
+            activeAudioPrefetchCall?.cancel()
+        } else {
+            activeVideoPrefetchCall?.cancel()
+        }
 
         prefetchPool.execute {
             runPrefetchLoop(url, session, n, isAudio, gen)
@@ -646,7 +688,14 @@ object LocalPlaylistServer {
             if (cachedSegment(nextUrl) != null) continue
 
             try {
-                val raw = fetchBytes(nextUrl, session, isPrefetch = true) ?: continue
+                val raw = fetchBytes(
+                    nextUrl,
+                    session,
+                    isPrefetch = true,
+                    prefetchGen = gen,
+                    isAudio = isAudio
+                ) ?: continue
+
                 if (genRef.get() != gen) return
                 val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
                 rememberSegment(nextUrl, cleaned)
@@ -659,8 +708,13 @@ object LocalPlaylistServer {
         }
     }
 
-    /** Dedicated OkHttp fetch with HTTP/2 multiplexing. */
-    private fun fetchViaOkHttp(url: String, session: Session): ByteArray? {
+    /** Dedicated OkHttp fetch with HTTP/2 multiplexing and active Call tracking. */
+    private fun fetchViaOkHttp(
+        url: String,
+        session: Session,
+        isPrefetch: Boolean = false,
+        isAudio: Boolean = false
+    ): ByteArray? {
         val resolved = rewriteCdnHost(url)
         val ua = session.headers["User-Agent"] ?: "Mozilla/5.0"
         val req = Request.Builder()
@@ -671,8 +725,14 @@ object LocalPlaylistServer {
             .header("Origin", "https://flixcloud.cc")
             .get()
             .build()
+
+        val call = httpClient.newCall(req)
+        if (isPrefetch) {
+            if (isAudio) activeAudioPrefetchCall = call else activeVideoPrefetchCall = call
+        }
+
         return try {
-            httpClient.newCall(req).execute().use { res ->
+            call.execute().use { res ->
                 if (!res.isSuccessful) {
                     Log.w(TAG, "upstream HTTP ${res.code} url=${resolved.take(110)}")
                     return null
@@ -688,8 +748,18 @@ object LocalPlaylistServer {
                 } else null
             }
         } catch (e: Exception) {
-            Log.w(TAG, "fetch failed ${resolved.take(80)}: ${e.message}")
+            if (!call.isCanceled()) {
+                Log.w(TAG, "fetch failed ${resolved.take(80)}: ${e.message}")
+            }
             null
+        } finally {
+            if (isPrefetch) {
+                if (isAudio) {
+                    if (activeAudioPrefetchCall === call) activeAudioPrefetchCall = null
+                } else {
+                    if (activeVideoPrefetchCall === call) activeVideoPrefetchCall = null
+                }
+            }
         }
     }
 
