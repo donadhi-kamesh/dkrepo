@@ -96,8 +96,7 @@ class FlixCloud : ExtractorApi() {
         }
 
         val quality = parseMasterQuality(masterText)
-        val slim = slimMaster(masterText, masterUrl)
-        val absolutized = absolutizePlaylist(slim, masterUrl)
+        val absolutized = absolutizePlaylist(masterText, masterUrl)
         val firstLine = absolutized.lines()
             .map { it.trim() }
             .firstOrNull { it.isNotEmpty() && !it.startsWith("#") }

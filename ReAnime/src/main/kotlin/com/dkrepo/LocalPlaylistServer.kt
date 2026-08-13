@@ -2,6 +2,7 @@ package com.dkrepo
 
 import android.util.Base64
 import com.lagradost.api.Log
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
@@ -11,7 +12,6 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
@@ -21,41 +21,68 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 
 /**
+ * Thread-safe bounded LRU cache for memory safety on Android devices.
+ */
+private class BoundedLruCache<K : Any, V : Any>(private val maxSize: Int) {
+    private val map = object : LinkedHashMap<K, V>(maxSize + 1, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<K, V>?): Boolean {
+            return size > maxSize
+        }
+    }
+    private val lock = Any()
+
+    fun get(key: K): V? = synchronized(lock) { map[key] }
+    fun put(key: K, value: V): V? = synchronized(lock) { map.put(key, value) }
+    fun remove(key: K): V? = synchronized(lock) { map.remove(key) }
+    fun clear() = synchronized(lock) { map.clear() }
+    val size: Int get() = synchronized(lock) { map.size }
+}
+
+/**
  * Localhost HTTP server that serves unwrapped m3u8 playlists and proxies
  * segment/key fetches so we can strip PNG/WebP/XOR disguises to real MPEG-TS.
- *
- * Segment remote URLs are embedded (base64) in the request so we never lose
- * mappings when many HD-1/HD-2 playlists are published at once.
  */
 object LocalPlaylistServer {
     private const val TAG = "FlixCloudLocal"
     private val playlists = ConcurrentHashMap<String, ByteArray>()
     private val sessions = ConcurrentHashMap<String, Session>()
     private val nestedPlaylistUrls = ConcurrentHashMap<String, String>()
-    private val segmentCache = ConcurrentHashMap<String, ByteArray>()
-    private val playlistBodyCache = ConcurrentHashMap<String, ByteArray>()
+
+    // Bounded LRU caches prevent memory thrashing and GC pauses
+    private val segmentCache = BoundedLruCache<String, ByteArray>(32)
+    private val playlistBodyCache = BoundedLruCache<String, ByteArray>(16)
+
+    // In-flight deduplication
     private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
-    private val playbackPermits = Semaphore(3)
-    private val prefetchPermits = Semaphore(2)
+
+    // Playback state and generation counter for instant prefetch cancellation on seek
     private val playHead = AtomicInteger(-1)
-    private val prefetchPool = Executors.newFixedThreadPool(2) { r ->
+    private val prefetchGeneration = AtomicInteger(0)
+
+    // Thread pool for prefetching upcoming segments in parallel
+    private val prefetchPool = Executors.newFixedThreadPool(4) { r ->
         Thread(r, "FlixCloud-Prefetch").apply { isDaemon = true }
     }
+
+    // Thread pool for handling incoming client socket requests
+    private val clientPool = Executors.newCachedThreadPool { r ->
+        Thread(r, "FlixCloud-Client").apply { isDaemon = true }
+    }
+
     /** Last CDN disguise that returned 200, keyed by directory (`.../_v7/uuid` vs `.../audio`). */
     private val workingExtByDir = ConcurrentHashMap<String, String>()
 
     /**
-     * Own OkHttp client so preview/catalog traffic on Cloudstream's shared
-     * NiceHttp dispatcher cannot starve playback.
+     * Dedicated OkHttpClient configured with high connection limits and connection reuse.
      */
     private val httpClient: OkHttpClient by lazy {
         val dispatcher = Dispatcher().apply {
-            maxRequests = 5
-            maxRequestsPerHost = 5
+            maxRequests = 32
+            maxRequestsPerHost = 16
         }
         OkHttpClient.Builder()
             .dispatcher(dispatcher)
-            .connectionPool(ConnectionPool(6, 5, TimeUnit.MINUTES))
+            .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)
@@ -99,7 +126,9 @@ object LocalPlaylistServer {
             while (!ss.isClosed) {
                 try {
                     val client = ss.accept()
-                    thread(isDaemon = true, name = "FlixCloud-M3U8-Client") {
+                    client.tcpNoDelay = true
+                    client.sendBufferSize = 64 * 1024
+                    clientPool.execute {
                         handle(client)
                     }
                 } catch (_: Exception) {
@@ -121,9 +150,10 @@ object LocalPlaylistServer {
     ): String {
         val p = ensureStarted()
         playHead.set(-1)
+        prefetchGeneration.incrementAndGet()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
-        val rewritten = rewritePlaylist(body, sessionId, p, prefetchPlaylists = false)
+        val rewritten = rewritePlaylist(body, sessionId, p)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
         trimMaps()
@@ -133,17 +163,12 @@ object LocalPlaylistServer {
     private fun rewritePlaylist(
         body: String,
         sessionId: String,
-        p: Int,
-        prefetchPlaylists: Boolean
+        p: Int
     ): String {
         val uriTagRegex = Regex("""URI=["']([^"']+)["']""")
         fun mapRemote(uri: String): String {
             val url = rewriteCdnHost(uri)
-            return if (prefetchPlaylists && looksLikePlaylistUrl(url)) {
-                materializePlaylist(url, sessionId, p)
-            } else {
-                proxyUrl(sessionId, url, p)
-            }
+            return proxyUrl(sessionId, url, p)
         }
         return body.lines().joinToString("\n") { line ->
             val t = line.trim()
@@ -163,37 +188,6 @@ object LocalPlaylistServer {
                 else -> line
             }
         }
-    }
-
-    /**
-     * Fetch a nested media playlist once, mark it VOD so ExoPlayer gets a real
-     * duration (seek), and serve it from localhost instead of re-hitting the CDN
-     * every target-duration (live reload = buffering).
-     */
-    private fun materializePlaylist(remote: String, sessionId: String, p: Int): String {
-        val cacheKey = "$sessionId|$remote"
-        nestedPlaylistUrls[cacheKey]?.let { return it }
-        val session = sessions[sessionId] ?: return proxyUrl(sessionId, remote, p)
-        val raw = fetchPlaylistBytes(remote, session)
-        var text = raw?.let { String(it, Charsets.UTF_8) } ?: ""
-        if (!text.trimStart().startsWith("#EXTM3U") &&
-            session.xorKey != null && session.xorKey.isNotEmpty()
-        ) {
-            val unwrapped = xorUnwrapText(text, session.xorKey)
-            if (unwrapped.trimStart().startsWith("#EXTM3U")) text = unwrapped
-        }
-        if (!text.trimStart().startsWith("#EXTM3U")) {
-            Log.w(TAG, "prefetch playlist failed: ${remote.substringBefore('?').take(90)}")
-            return proxyUrl(sessionId, remote, p)
-        }
-        val vod = ensureVod(absoluteize(text, remote))
-        val rewritten = rewritePlaylist(vod, sessionId, p, prefetchPlaylists = false)
-        val id = UUID.randomUUID().toString().replace("-", "")
-        playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
-        val local = "http://127.0.0.1:$p/$id.m3u8"
-        nestedPlaylistUrls[cacheKey] = local
-        Log.i(TAG, "cached VOD playlist $id from ${remote.substringBefore('?').take(70)}")
-        return local
     }
 
     /** Dead fetchN.flixcloud.cc hosts (UnknownHost) all alias to fetch.flixcloud.cc. */
@@ -230,25 +224,17 @@ object LocalPlaylistServer {
     }
 
     private fun trimMaps() {
-        if (playlists.size > 128) {
+        if (playlists.size > 64) {
             val keys = playlists.keys().toList()
-            keys.take(keys.size - 96).forEach { playlists.remove(it) }
+            keys.take(keys.size - 48).forEach { playlists.remove(it) }
         }
-        if (sessions.size > 48) {
+        if (sessions.size > 32) {
             val keys = sessions.keys().toList()
-            keys.take(keys.size - 32).forEach { sessions.remove(it) }
+            keys.take(keys.size - 24).forEach { sessions.remove(it) }
         }
-        if (nestedPlaylistUrls.size > 128) {
+        if (nestedPlaylistUrls.size > 64) {
             val keys = nestedPlaylistUrls.keys().toList()
-            keys.take(keys.size - 96).forEach { nestedPlaylistUrls.remove(it) }
-        }
-        if (segmentCache.size > 160) {
-            val keys = segmentCache.keys().toList()
-            keys.take(keys.size - 120).forEach { segmentCache.remove(it) }
-        }
-        if (playlistBodyCache.size > 32) {
-            val keys = playlistBodyCache.keys().toList()
-            keys.take(keys.size - 24).forEach { playlistBodyCache.remove(it) }
+            keys.take(keys.size - 48).forEach { nestedPlaylistUrls.remove(it) }
         }
     }
 
@@ -264,7 +250,7 @@ object LocalPlaylistServer {
                 val target = requestLine.split(' ').getOrNull(1) ?: ""
                 val path = target.substringBefore('?').trimStart('/')
                 val query = target.substringAfter('?', "")
-                val out = s.getOutputStream()
+                val out = BufferedOutputStream(s.getOutputStream(), 32 * 1024)
                 when {
                     path.startsWith("s/") -> {
                         val sessionId = path.removePrefix("s/").substringBefore('/')
@@ -302,17 +288,11 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Serve a media/variant playlist (referenced from the master or from an
-     * #EXT-X-MEDIA audio group) back to ExoPlayer. These are NOT segments: they
-     * must be fetched, unwrapped (fetch7 base64-XOR), absolutized and have their
-     * own segment/URI references re-proxied so ExoPlayer can keep resolving the
-     * HLS chain. Before this, every referenced playlist was run through
-     * normalizeSegment() (which only accepts TS/fMP4), returning an empty 502
-     * and making ExoPlayer fail instantly with an "unsupported format" error.
+     * Serve a media/variant playlist back to ExoPlayer.
      */
     private fun servePlaylist(remote: String, session: Session, sessionId: String, out: java.io.OutputStream) {
-        val cacheKey = remote.substringBefore('?')
-        playlistBodyCache[cacheKey]?.let { cached ->
+        val cacheKey = canonicalKey(remote)
+        playlistBodyCache.get(cacheKey)?.let { cached ->
             writeResponse(out, 200, "application/vnd.apple.mpegurl", cached, cache = true)
             return
         }
@@ -330,18 +310,14 @@ object LocalPlaylistServer {
             return
         }
         val vod = ensureVod(absoluteize(text, remote))
-        val rewritten = rewritePlaylist(vod, sessionId, port, prefetchPlaylists = false)
+        val rewritten = rewritePlaylist(vod, sessionId, port)
         val bytes = rewritten.toByteArray(Charsets.UTF_8)
-        playlistBodyCache[cacheKey] = bytes
+        playlistBodyCache.put(cacheKey, bytes)
         writeResponse(out, 200, "application/vnd.apple.mpegurl", bytes, cache = true)
-        prefetchPlaylistHead(vod, session)
     }
 
     /**
-     * Fetch raw playlist bytes, preferring a real m3u8 over a Cloudflare
-     * challenge. Tries the OkHttp path first (covers slopnet/fetch hosts) and
-     * falls back to the hidden WebView (real Chromium TLS) which passes the
-     * vault*. Cloudflare zone.
+     * Fetch raw playlist bytes from fetch.flixcloud.cc.
      */
     private fun fetchPlaylistBytes(url: String, session: Session): ByteArray? {
         fun usable(b: ByteArray?): Boolean {
@@ -424,28 +400,23 @@ object LocalPlaylistServer {
             writeResponse(out, 400, "text/plain", ByteArray(0))
             return
         }
+
+        // Return cached segment immediately if available
         cachedSegment(remote)?.let { cached ->
-            val mime = when {
-                looksLikeFmp4(cached) -> "video/mp4"
-                looksLikeAdts(cached) -> "audio/aac"
-                else -> "video/mp2t"
-            }
+            val mime = detectMimeType(cached)
             writeResponse(out, 200, mime, cached, cache = true)
-            if (isPlaybackWindow(remote)) {
-                notePlayback(remote)
-                prefetchAhead(remote, session)
-            }
+            onSegmentPlayed(remote, session)
             return
         }
-        // A referenced *.m3u8 is itself a media/variant playlist that ExoPlayer
-        // must be able to fetch next (variant + #EXT-X-MEDIA audio groups), not a
-        // TS segment. Handle it separately so it is served as a valid playlist.
+
+        // Handle nested media playlist
         if (looksLikePlaylistUrl(remote)) {
             servePlaylist(remote, session, sessionId, out)
             return
         }
+
         try {
-            val raw = fetchBytes(remote, session)
+            val raw = fetchBytes(remote, session, isPrefetch = false)
             if (raw == null) {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
                 return
@@ -472,11 +443,7 @@ object LocalPlaylistServer {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
                 return
             }
-            val mime = when {
-                looksLikeFmp4(cleaned) -> "video/mp4"
-                looksLikeAdts(cleaned) -> "audio/aac"
-                else -> "video/mp2t"
-            }
+            val mime = detectMimeType(cleaned)
             Log.i(
                 TAG,
                 "segment ok len=${cleaned.size} mime=$mime opaque=$opaque " +
@@ -489,39 +456,36 @@ object LocalPlaylistServer {
             } catch (e: Exception) {
                 Log.w(TAG, "client gone after fetch: ${e.message}")
             }
-            if (isPlaybackWindow(remote)) {
-                notePlayback(remote)
-                prefetchAhead(remote, session)
-            }
-            trimMaps()
+            onSegmentPlayed(remote, session)
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             try { writeResponse(out, 502, "text/plain", ByteArray(0)) } catch (_: Exception) {}
         }
     }
 
-    private fun cacheKey(url: String): String =
-        rewriteCdnHost(url).substringBefore('?')
+    private fun detectMimeType(data: ByteArray): String = when {
+        looksLikeFmp4(data) -> "video/mp4"
+        looksLikeAdts(data) -> "audio/aac"
+        else -> "video/mp2t"
+    }
+
+    private fun canonicalKey(url: String): String {
+        val rewritten = rewriteCdnHost(url)
+        val noQuery = rewritten.substringBefore('?')
+        return runCatching { java.net.URL(noQuery).path }.getOrNull() ?: noQuery
+    }
 
     private fun cachedSegment(remote: String): ByteArray? {
-        val key = cacheKey(remote)
-        segmentCache[key]?.let { return it }
-        segmentCache[remote]?.let { return it }
-        val path = runCatching { java.net.URL(key).path }.getOrNull() ?: return null
-        return segmentCache["https://fetch.flixcloud.cc$path"]
+        return segmentCache.get(canonicalKey(remote))
     }
 
     private fun rememberSegment(remote: String, cleaned: ByteArray) {
-        val key = cacheKey(remote)
-        segmentCache[key] = cleaned
-        segmentCache[remote] = cleaned
-        val path = runCatching { java.net.URL(key).path }.getOrNull()
-        if (path != null) segmentCache["https://fetch.flixcloud.cc$path"] = cleaned
+        segmentCache.put(canonicalKey(remote), cleaned)
     }
 
     /**
      * Vault/lock/rundown CDN hosts 403 OkHttp. The working path is always
-     * fetch.flixcloud.cc + JWT. Skip the 403 round-trips and skip WebView.
+     * fetch.flixcloud.cc + JWT. Skip the 403 round-trips.
      */
     private fun v7FetchUrl(url: String, token: String?): String {
         val resolved = rewriteCdnHost(url)
@@ -532,13 +496,14 @@ object LocalPlaylistServer {
         return if (!token.isNullOrEmpty()) withToken(base, token) else base
     }
 
-    private fun fetchBytes(url: String, session: Session, prefetch: Boolean = false): ByteArray? {
+    private fun fetchBytes(url: String, session: Session, isPrefetch: Boolean = false): ByteArray? {
         val token = session.segmentReferer
             ?.substringAfter("token=", "")
             ?.takeIf { it.isNotEmpty() }
         val primary = v7FetchUrl(url, token)
-        if (!prefetch) Log.i(TAG, "fetchBytes ${primary.substringBefore('?').take(100)}")
+        if (!isPrefetch) Log.i(TAG, "fetchBytes ${primary.substringBefore('?').take(100)}")
 
+        // Deduplicate in-flight requests (attach to running future)
         inflight[primary]?.let { existing ->
             return try {
                 existing.get(20, TimeUnit.SECONDS)
@@ -548,17 +513,9 @@ object LocalPlaylistServer {
             }
         }
 
-        val permits = if (prefetch) prefetchPermits else playbackPermits
-        if (prefetch) {
-            if (!permits.tryAcquire()) return null
-        } else {
-            permits.acquire()
-        }
-
         val created = CompletableFuture<ByteArray?>()
         val existing = inflight.putIfAbsent(primary, created)
         if (existing != null) {
-            permits.release()
             return try {
                 existing.get(20, TimeUnit.SECONDS)
             } catch (e: Exception) {
@@ -566,6 +523,7 @@ object LocalPlaylistServer {
                 null
             }
         }
+
         return try {
             var bytes: ByteArray? = null
             for (candidate in segmentUrlVariants(primary)) {
@@ -583,7 +541,6 @@ object LocalPlaylistServer {
             null
         } finally {
             inflight.remove(primary, created)
-            permits.release()
         }
     }
 
@@ -639,63 +596,46 @@ object LocalPlaylistServer {
     private fun segNumber(url: String): Int? =
         Regex("seg-(\\d+)").find(url)?.groupValues?.get(1)?.toIntOrNull()
 
-    private fun notePlayback(url: String) {
+    /**
+     * Called whenever a segment is actively played/requested by ExoPlayer.
+     * Updates playHead and triggers parallel prefetch of upcoming segments.
+     */
+    private fun onSegmentPlayed(url: String, session: Session) {
         val n = segNumber(url) ?: return
-        val head = playHead.get()
-        if (url.contains("/audio/") || head < 0 || kotlin.math.abs(n - head) <= 8) {
-            playHead.set(n)
+        val prev = playHead.getAndSet(n)
+        if (prev >= 0 && kotlin.math.abs(n - prev) > 4) {
+            // User seeked: cancel older prefetch tasks
+            prefetchGeneration.incrementAndGet()
         }
+        prefetchAhead(url, session, n)
     }
 
-    private fun isPlaybackWindow(url: String): Boolean {
-        val n = segNumber(url) ?: return true
-        val head = playHead.get()
-        if (head < 0) return true
-        if (url.contains("/audio/")) return true
-        return kotlin.math.abs(n - head) <= 8
-    }
+    /**
+     * Prefetches upcoming segments in parallel using the prefetch thread pool.
+     */
+    private fun prefetchAhead(remote: String, session: Session, currentSeg: Int) {
+        val currentGen = prefetchGeneration.get()
+        val lookaheadCount = if (remote.contains("/audio/")) 4 else 5
 
-    private fun prefetchAhead(remote: String, session: Session) {
-        if (!isPlaybackWindow(remote)) return
-        val n = segNumber(remote) ?: return
-        val count = if (remote.contains("/audio/")) 3 else 4
-        prefetchPool.execute {
-            for (delta in 1..count) {
-                val next = remote.replaceFirst("seg-$n", "seg-${n + delta}")
-                if (cachedSegment(next) != null) continue
+        for (delta in 1..lookaheadCount) {
+            val targetSeg = currentSeg + delta
+            val nextUrl = remote.replaceFirst("seg-$currentSeg", "seg-$targetSeg")
+            if (cachedSegment(nextUrl) != null) continue
+
+            prefetchPool.execute {
+                if (prefetchGeneration.get() != currentGen) return@execute
                 try {
-                    val raw = fetchBytes(next, session, prefetch = true) ?: continue
-                    val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
-                    rememberSegment(next, cleaned)
+                    val raw = fetchBytes(nextUrl, session, isPrefetch = true) ?: return@execute
+                    if (prefetchGeneration.get() != currentGen) return@execute
+                    val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
+                    rememberSegment(nextUrl, cleaned)
                 } catch (_: Exception) {
                 }
             }
         }
     }
 
-    private fun prefetchPlaylistHead(playlist: String, session: Session) {
-        val urls = playlist.lineSequence()
-            .map { it.trim() }
-            .filter { it.startsWith("http://") || it.startsWith("https://") }
-            .filter { !looksLikePlaylistUrl(it) }
-            .toList()
-        val video = urls.filter { !it.contains("/audio/") }.take(4)
-        val audio = urls.filter { it.contains("/audio/") }.take(3)
-        if (video.isEmpty() && audio.isEmpty()) return
-        prefetchPool.execute {
-            for (u in video + audio) {
-                if (cachedSegment(u) != null) continue
-                try {
-                    val raw = fetchBytes(u, session, prefetch = true) ?: continue
-                    val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
-                    rememberSegment(u, cleaned)
-                } catch (_: Exception) {
-                }
-            }
-        }
-    }
-
-    /** Dedicated OkHttp fetch — not Cloudstream's shared NiceHttp client. */
+    /** Dedicated OkHttp fetch with HTTP/2 multiplexing. */
     private fun fetchViaOkHttp(url: String, session: Session): ByteArray? {
         val resolved = rewriteCdnHost(url)
         val ua = session.headers["User-Agent"] ?: "Mozilla/5.0"
@@ -762,8 +702,20 @@ object LocalPlaylistServer {
         return null
     }
 
-    private fun xorBytes(data: ByteArray, key: ByteArray): ByteArray =
-        ByteArray(data.size) { i -> (data[i].toInt() xor key[i % key.size].toInt()).toByte() }
+    /**
+     * High-speed primitive array XOR loop without lambda boxing overhead.
+     */
+    private fun xorBytes(data: ByteArray, key: ByteArray): ByteArray {
+        val out = ByteArray(data.size)
+        val keyLen = key.size
+        var i = 0
+        val len = data.size
+        while (i < len) {
+            out[i] = (data[i].toInt() xor key[i % keyLen].toInt()).toByte()
+            i++
+        }
+        return out
+    }
 
     /** Walk RIFF chunks and try AES-CBC; used when simple strip/XOR fails. */
     private fun deepRecover(raw: ByteArray, xorKey: ByteArray?): ByteArray? {

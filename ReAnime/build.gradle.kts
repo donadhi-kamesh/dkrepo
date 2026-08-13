@@ -1,7 +1,7 @@
 import com.android.build.gradle.LibraryExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
 
-version = 36
+version = 37
 
 fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
     extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
