@@ -493,51 +493,214 @@ object LocalPlaylistServer {
             return
         }
 
+        // Kick the prefetch lane at REQUEST time so following segments download
+        // in PARALLEL with this cold one (not after it finishes).
+        onSegmentPlayed(remote, session)
+
+        // Cold segment: stream it to ExoPlayer while downloading (sub-second
+        // first byte) instead of buffering the whole throttled download.
+        if (tryServeStreaming(remote, session, out)) return
+
         try {
             val raw = fetchBytes(remote, session, isPrefetch = false)
-            if (raw == null) {
+            if (!serveNormalizedBytes(remote, session, raw, out)) {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
-                return
             }
-            var cleaned = normalizeSegment(raw, session.xorKey)
-            var opaque = false
-            if (cleaned == null && session.allowOpaque) {
-                // Image disguise around AES-128 HLS ciphertext — ExoPlayer decrypts via EXT-X-KEY
-                val stripped = stripImageContainer(raw)
-                cleaned = if (stripped !== raw && stripped.isNotEmpty()) stripped else null
-                opaque = cleaned != null
-            }
-            if (cleaned == null) {
-                // Last resort: scan RIFF chunks / full buffer for embedded media after XOR
-                cleaned = deepRecover(raw, session.xorKey)
-            }
-            if (cleaned == null) {
-                Log.w(
-                    TAG,
-                    "normalize failed len=${raw.size} " +
-                        "head=${raw.take(8).joinToString("") { "%02x".format(it) }} " +
-                        "xor=${session.xorKey != null} url=${remote.take(100)}"
-                )
-                writeResponse(out, 502, "text/plain", ByteArray(0))
-                return
-            }
-            val mime = detectMimeType(cleaned)
-            Log.i(
-                TAG,
-                "segment ok len=${cleaned.size} mime=$mime opaque=$opaque " +
-                    "head=${cleaned.take(4).joinToString("") { "%02x".format(it) }} " +
-                    "from ${remote.substringBefore('?').take(80)}"
-            )
-            rememberSegment(remote, cleaned)
-            try {
-                writeResponse(out, 200, mime, cleaned, cache = true)
-            } catch (e: Exception) {
-                Log.w(TAG, "client gone after fetch: ${e.message}")
-            }
-            onSegmentPlayed(remote, session)
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             try { writeResponse(out, 502, "text/plain", ByteArray(0)) } catch (_: Exception) {}
+        }
+    }
+
+    /** Normalize a fetched (possibly disguised) segment and serve it buffered. */
+    private fun serveNormalizedBytes(
+        remote: String,
+        session: Session,
+        raw: ByteArray?,
+        out: java.io.OutputStream
+    ): Boolean {
+        if (raw == null || raw.isEmpty()) return false
+        var cleaned = normalizeSegment(raw, session.xorKey)
+        var opaque = false
+        if (cleaned == null && session.allowOpaque) {
+            // Image disguise around AES-128 HLS ciphertext — ExoPlayer decrypts via EXT-X-KEY
+            val stripped = stripImageContainer(raw)
+            cleaned = if (stripped !== raw && stripped.isNotEmpty()) stripped else null
+            opaque = cleaned != null
+        }
+        if (cleaned == null) {
+            // Last resort: scan RIFF chunks / full buffer for embedded media after XOR
+            cleaned = deepRecover(raw, session.xorKey)
+        }
+        if (cleaned == null) {
+            Log.w(
+                TAG,
+                "normalize failed len=${raw.size} " +
+                    "head=${raw.take(8).joinToString("") { "%02x".format(it) }} " +
+                    "xor=${session.xorKey != null} url=${remote.take(100)}"
+            )
+            return false
+        }
+        val mime = detectMimeType(cleaned)
+        Log.i(
+            TAG,
+            "segment ok len=${cleaned.size} mime=$mime opaque=$opaque " +
+                "head=${cleaned.take(4).joinToString("") { "%02x".format(it) }} " +
+                "from ${remote.substringBefore('?').take(80)}"
+        )
+        rememberSegment(remote, cleaned)
+        return try {
+            writeResponse(out, 200, mime, cleaned, cache = true)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "client gone after fetch: ${e.message}")
+            true // response was already handled; the client simply left
+        }
+    }
+
+
+
+    /**
+     * Cold-segment fast path: open the upstream and peek the first bytes; if
+     * the body is already plain MPEG-TS / fMP4 / ADTS (no XOR / image
+     * disguise), stream it to ExoPlayer chunk-by-chunk WHILE it downloads —
+     * first byte arrives in milliseconds instead of after the whole throttled
+     * download — teeing the bytes into the segment cache. Disguised bodies
+     * fall back to buffered serving with the already-downloaded bytes.
+     * Returns false only when no upstream could be opened at all, so the
+     * caller can retry via [fetchBytes].
+     */
+    private fun tryServeStreaming(remote: String, session: Session, out: java.io.OutputStream): Boolean {
+        val token = session.segmentReferer
+            ?.substringAfter("token=", "")
+            ?.takeIf { it.isNotEmpty() }
+        val primary = v7FetchUrl(remote, token)
+        val identity = segmentIdentityKey(primary)
+        val ua = session.headers["User-Agent"] ?: "Mozilla/5.0"
+
+        fun openUpstream(): okhttp3.Response? {
+            for (candidate in segmentUrlVariants(primary)) {
+                val call = httpClient.newCall(
+                    Request.Builder()
+                        .url(rewriteCdnHost(candidate))
+                        .header("User-Agent", ua)
+                        .header("Accept", "*/*")
+                        .header("Referer", "https://flixcloud.cc/")
+                        .header("Origin", "https://flixcloud.cc")
+                        .get()
+                        .build()
+                )
+                try {
+                    val res = call.execute()
+                    if (res.isSuccessful) {
+                        rememberWorkingExt(candidate)
+                        return res
+                    }
+                    Log.w(TAG, "upstream HTTP ${res.code} url=${candidate.take(110)}")
+                    res.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "stream open failed ${candidate.take(80)}: ${e.message}")
+                }
+            }
+            return null
+        }
+
+        // Join an in-flight download (e.g. the playlist pre-warm) instead of
+        // opening a second throttled connection for the same segment.
+        fun awaitBuffered(f: CompletableFuture<ByteArray?>): Boolean = try {
+            val raw = f.get(25, TimeUnit.SECONDS)
+            serveNormalizedBytes(remote, session, raw, out)
+        } catch (e: Exception) {
+            Log.w(TAG, "streaming join failed: ${e.message}")
+            false
+        }
+
+        inflight[identity]?.let { return awaitBuffered(it) }
+        val created = CompletableFuture<ByteArray?>()
+        inflight.putIfAbsent(identity, created)?.let { return awaitBuffered(it) }
+
+        try {
+            val res = openUpstream() ?: return false
+            res.use { r ->
+                val body = r.body ?: run { created.complete(null); return false }
+                val src = body.byteStream()
+
+                // Peek the first 1KB to decide between streaming pass-through
+                // (plain media) and the buffered normalize fallback.
+                val peek = java.io.ByteArrayOutputStream()
+                val small = ByteArray(1024)
+                while (peek.size() < 1024) {
+                    val n = src.read(small)
+                    if (n < 0) break
+                    peek.write(small, 0, n)
+                }
+                val head = peek.toByteArray()
+                if (head.isEmpty()) {
+                    created.complete(null)
+                    return false
+                }
+
+                if (strictTs(head) || looksLikeFmp4(head) || looksLikeAdts(head)) {
+                    val contentLength = body.contentLength()
+                    val chunked = contentLength < 0
+                    val mime = when {
+                        looksLikeFmp4(head) -> "video/mp4"
+                        looksLikeAdts(head) -> "audio/aac"
+                        else -> "video/mp2t"
+                    }
+                    val tee = java.io.ByteArrayOutputStream(maxOf(2048, head.size * 4))
+                    val header = buildString {
+                        append("HTTP/1.1 200 OK\r\n")
+                        append("Content-Type: $mime\r\n")
+                        if (chunked) append("Transfer-Encoding: chunked\r\n")
+                        else append("Content-Length: $contentLength\r\n")
+                        append("Access-Control-Allow-Origin: *\r\n")
+                        append("Cache-Control: public, max-age=3600\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(header.toByteArray(Charsets.US_ASCII))
+                    tee.write(head)
+                    try {
+                        // Flush header + first bytes immediately so the player
+                        // starts decoding while the rest downloads.
+                        writeStreamChunk(out, head, head.size, chunked)
+                        out.flush()
+                        val buf = ByteArray(32 * 1024)
+                        while (true) {
+                            val n = src.read(buf)
+                            if (n < 0) break
+                            if (n == 0) continue
+                            tee.write(buf, 0, n)
+                            writeStreamChunk(out, buf, n, chunked)
+                            out.flush()
+                        }
+                        if (chunked) out.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        out.flush()
+                        Log.i(TAG, "streamed ${identity.substringAfterLast('/')} ${tee.size()}b $mime")
+                    } catch (e: Exception) {
+                        // Player hung up mid-stream (seek / released / timeout).
+                        // Cache only complete bodies.
+                        Log.w(TAG, "client gone mid-stream: ${e.message}")
+                        created.complete(null)
+                        return true // headers already sent
+                    }
+                    val cleaned = tee.toByteArray()
+                    if (!chunked && cleaned.size.toLong() != contentLength) {
+                        created.complete(null)
+                        return true // truncated body; don't cache
+                    }
+                    rememberSegment(remote, cleaned)
+                    created.complete(cleaned)
+                    return true
+                }
+
+                // Disguised body: finish buffering, then normalize + serve.
+                val raw = head + src.readBytes()
+                created.complete(raw)
+                return serveNormalizedBytes(remote, session, raw, out)
+            }
+        } finally {
+            inflight.remove(identity, created)
         }
     }
 
@@ -1064,6 +1227,18 @@ object LocalPlaylistServer {
             return i
         }
         return -1
+    }
+
+    /** Write one HTTP body chunk, using chunked transfer framing when needed. */
+    private fun writeStreamChunk(out: java.io.OutputStream, buf: ByteArray, len: Int, chunked: Boolean) {
+        if (chunked) {
+            out.write(len.toString(16).toByteArray(Charsets.US_ASCII))
+            out.write("\r\n".toByteArray(Charsets.US_ASCII))
+            out.write(buf, 0, len)
+            out.write("\r\n".toByteArray(Charsets.US_ASCII))
+        } else {
+            out.write(buf, 0, len)
+        }
     }
 
     private fun writeResponse(
