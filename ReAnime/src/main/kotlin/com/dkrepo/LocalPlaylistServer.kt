@@ -17,6 +17,7 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import okhttp3.Call
 import okhttp3.ConnectionPool
@@ -73,12 +74,20 @@ object LocalPlaylistServer {
     @Volatile
     private var lastAudioUrl: String? = null
 
-    // All in-flight prefetch calls per lane, so a seek can cancel EVERY stale
-    // download at once and free full bandwidth for the seek target.
-    private val activeVideoPrefetchCalls =
-        Collections.newSetFromMap(ConcurrentHashMap<Call, Boolean>())
-    private val activeAudioPrefetchCalls =
-        Collections.newSetFromMap(ConcurrentHashMap<Call, Boolean>())
+    // In-flight prefetch Call -> segment number. A seek only cancels downloads
+    // that fall outside the new playhead window so a 15–40s skip can reuse work.
+    private val activeVideoPrefetchCalls = ConcurrentHashMap<Call, Int>()
+    private val activeAudioPrefetchCalls = ConcurrentHashMap<Call, Int>()
+
+    // PAT+PMT prefix from the first good TS segment per lane. Later segments
+    // sometimes omit PSI, which makes ExoPlayer hang on seek (endless buffer).
+    private val tsPsiVideo = AtomicReference<ByteArray?>(null)
+    private val tsPsiAudio = AtomicReference<ByteArray?>(null)
+
+    // Player is fetching a cold playhead segment — keep lookahead short so the
+    // seek target is not starved by 8 extra CDN connections.
+    private val videoUrgent = AtomicInteger(0)
+    private val audioUrgent = AtomicInteger(0)
 
     // The CDN throttles each TCP connection to ~250KB/s, so prefetch runs
     // several parallel connections per lane: 3 video + 2 audio.
@@ -193,8 +202,12 @@ object LocalPlaylistServer {
         playHeadAudio.set(-1)
         videoPrefetchGen.incrementAndGet()
         audioPrefetchGen.incrementAndGet()
-        activeVideoPrefetchCalls.forEach { it.cancel() }
-        activeAudioPrefetchCalls.forEach { it.cancel() }
+        activeVideoPrefetchCalls.keys.forEach { it.cancel() }
+        activeAudioPrefetchCalls.keys.forEach { it.cancel() }
+        tsPsiVideo.set(null)
+        tsPsiAudio.set(null)
+        segmentCache.clear()
+        playlistBodyCache.clear()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         val session = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         sessions[sessionId] = session
@@ -273,6 +286,10 @@ object LocalPlaylistServer {
         val lines = ArrayList<String>()
         var sawType = false
         for (line in text.lineSequence()) {
+            // Segments are not reliably independent (some omit PAT/PMT or IDR).
+            // Advertising this tag makes ExoPlayer skip the previous segment on
+            // seek, which is the "endless buffer" at some timestamps.
+            if (line.startsWith("#EXT-X-INDEPENDENT-SEGMENTS")) continue
             if (line.startsWith("#EXT-X-PLAYLIST-TYPE")) sawType = true
             lines.add(line)
         }
@@ -483,7 +500,7 @@ object LocalPlaylistServer {
         cachedSegment(remote)?.let { cached ->
             val mime = detectMimeType(cached)
             writeResponse(out, 200, mime, cached, cache = true)
-            onSegmentPlayed(remote, session)
+            onSegmentPlayed(remote, session, kickPrefetch = true)
             return
         }
 
@@ -493,15 +510,17 @@ object LocalPlaylistServer {
             return
         }
 
-        // Kick the prefetch lane at REQUEST time so following segments download
-        // in PARALLEL with this cold one (not after it finishes).
-        onSegmentPlayed(remote, session)
-
-        // Cold segment: stream it to ExoPlayer while downloading (sub-second
-        // first byte) instead of buffering the whole throttled download.
-        if (tryServeStreaming(remote, session, out)) return
-
+        // Update playhead / cancel stale prefetch immediately, but keep
+        // lookahead short until this cold segment is in cache.
+        val isAudio = remote.contains("/audio/")
+        val urgentRef = if (isAudio) audioUrgent else videoUrgent
+        urgentRef.incrementAndGet()
+        onSegmentPlayed(remote, session, kickPrefetch = true)
         try {
+            // Cold segment: unwrap PNG/WEBP+XOR on the fly so ExoPlayer sees
+            // the first TS packets in milliseconds instead of after 1–2MB.
+            if (tryServeStreaming(remote, session, out)) return
+
             val raw = fetchBytes(remote, session, isPrefetch = false)
             if (!serveNormalizedBytes(remote, session, raw, out)) {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
@@ -509,6 +528,9 @@ object LocalPlaylistServer {
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             try { writeResponse(out, 502, "text/plain", ByteArray(0)) } catch (_: Exception) {}
+        } finally {
+            urgentRef.decrementAndGet()
+            schedulePrefetchLane(session, isAudio)
         }
     }
 
@@ -541,6 +563,8 @@ object LocalPlaylistServer {
             )
             return false
         }
+        val isAudio = remote.contains("/audio/")
+        cleaned = prepareForPlayer(cleaned, isAudio)
         val mime = detectMimeType(cleaned)
         Log.i(
             TAG,
@@ -620,7 +644,10 @@ object LocalPlaylistServer {
         inflight.putIfAbsent(identity, created)?.let { return awaitBuffered(it) }
 
         try {
-            val res = openUpstream() ?: return false
+            val res = openUpstream() ?: run {
+                created.complete(null)
+                return false
+            }
             res.use { r ->
                 val body = r.body ?: run { created.complete(null); return false }
                 val src = body.byteStream()
@@ -641,60 +668,15 @@ object LocalPlaylistServer {
                 }
 
                 if (strictTs(head) || looksLikeFmp4(head) || looksLikeAdts(head)) {
-                    val contentLength = body.contentLength()
-                    val chunked = contentLength < 0
-                    val mime = when {
-                        looksLikeFmp4(head) -> "video/mp4"
-                        looksLikeAdts(head) -> "audio/aac"
-                        else -> "video/mp2t"
-                    }
-                    val tee = java.io.ByteArrayOutputStream(maxOf(2048, head.size * 4))
-                    val header = buildString {
-                        append("HTTP/1.1 200 OK\r\n")
-                        append("Content-Type: $mime\r\n")
-                        if (chunked) append("Transfer-Encoding: chunked\r\n")
-                        else append("Content-Length: $contentLength\r\n")
-                        append("Access-Control-Allow-Origin: *\r\n")
-                        append("Cache-Control: public, max-age=3600\r\n")
-                        append("Connection: close\r\n\r\n")
-                    }
-                    out.write(header.toByteArray(Charsets.US_ASCII))
-                    tee.write(head)
-                    try {
-                        // Flush header + first bytes immediately so the player
-                        // starts decoding while the rest downloads.
-                        writeStreamChunk(out, head, head.size, chunked)
-                        out.flush()
-                        val buf = ByteArray(32 * 1024)
-                        while (true) {
-                            val n = src.read(buf)
-                            if (n < 0) break
-                            if (n == 0) continue
-                            tee.write(buf, 0, n)
-                            writeStreamChunk(out, buf, n, chunked)
-                            out.flush()
-                        }
-                        if (chunked) out.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                        out.flush()
-                        Log.i(TAG, "streamed ${identity.substringAfterLast('/')} ${tee.size()}b $mime")
-                    } catch (e: Exception) {
-                        // Player hung up mid-stream (seek / released / timeout).
-                        // Cache only complete bodies.
-                        Log.w(TAG, "client gone mid-stream: ${e.message}")
-                        created.complete(null)
-                        return true // headers already sent
-                    }
-                    val cleaned = tee.toByteArray()
-                    if (!chunked && cleaned.size.toLong() != contentLength) {
-                        created.complete(null)
-                        return true // truncated body; don't cache
-                    }
-                    rememberSegment(remote, cleaned)
-                    created.complete(cleaned)
-                    return true
+                    return streamPlain(remote, src, body, head, out, created)
                 }
 
-                // Disguised body: finish buffering, then normalize + serve.
+                val plan = detectUnwrapPlan(head)
+                if (plan != null) {
+                    return streamUnwrapped(remote, src, body, head, plan, out, created)
+                }
+
+                // Unknown disguise: finish buffering, then normalize + serve.
                 val raw = head + src.readBytes()
                 created.complete(raw)
                 return serveNormalizedBytes(remote, session, raw, out)
@@ -702,6 +684,165 @@ object LocalPlaylistServer {
         } finally {
             inflight.remove(identity, created)
         }
+    }
+
+    private data class UnwrapPlan(val headerSize: Int, val xorKey: ByteArray?)
+
+    /** PNG/WEBP wrapper around TS (optionally XOR'd). Null if the peek is not a known disguise. */
+    private fun detectUnwrapPlan(head: ByteArray): UnwrapPlan? {
+        val headerSize = when {
+            head.size >= 12 && isRiffMagic(head) &&
+                head[8] == 0x57.toByte() && head[9] == 0x45.toByte() &&
+                head[10] == 0x42.toByte() && head[11] == 0x50.toByte() -> 12
+            isPngMagic(head) -> 8
+            isRiffMagic(head) && head.size > 12 -> 12
+            else -> return null
+        }
+        if (head.size <= headerSize + 188 * 3) return null
+        val payload = head.copyOfRange(headerSize, head.size)
+        if (looksLikeTsHead(payload)) return UnwrapPlan(headerSize, null)
+        val probeLen = minOf(payload.size, 188 * 5)
+        for (key in listOf(SEGMENT_XOR_KEY)) {
+            val probe = xorBytes(payload.copyOf(probeLen), key)
+            if (looksLikeTsHead(probe)) return UnwrapPlan(headerSize, key)
+        }
+        return null
+    }
+
+    private fun looksLikeTsHead(data: ByteArray): Boolean {
+        if (data.size < 188 * 3) return false
+        var i = 0
+        var count = 0
+        while (i + 188 <= data.size && count < 5) {
+            if (data[i] != 0x47.toByte()) return false
+            if ((data[i + 1].toInt() and 0x80) != 0) return false
+            count++
+            i += 188
+        }
+        return count >= 3
+    }
+
+    private fun applyXor(buf: ByteArray, len: Int, startIndex: Int, key: ByteArray) {
+        val ks = key.size
+        if (ks == 0) return
+        var i = 0
+        while (i < len) {
+            buf[i] = (buf[i].toInt() xor key[(startIndex + i) % ks].toInt()).toByte()
+            i++
+        }
+    }
+
+    private fun streamPlain(
+        remote: String,
+        src: java.io.InputStream,
+        body: okhttp3.ResponseBody,
+        head: ByteArray,
+        out: java.io.OutputStream,
+        created: CompletableFuture<ByteArray?>
+    ): Boolean {
+        val isAudio = remote.contains("/audio/")
+        var sendHead = head
+        var extra = 0
+        if (strictTs(head)) {
+            sendHead = withPsiPrefix(head, isAudio)
+            extra = sendHead.size - head.size
+        }
+        val mime = when {
+            looksLikeFmp4(head) -> "video/mp4"
+            looksLikeAdts(head) -> "audio/aac"
+            else -> "video/mp2t"
+        }
+        val contentLength = body.contentLength()
+        val totalLen = if (contentLength < 0) -1L else contentLength + extra
+        return finishStream(remote, src, sendHead, /*xorKey*/ null, /*xorIndex*/ 0, mime, totalLen, isAudio, out, created)
+    }
+
+    private fun streamUnwrapped(
+        remote: String,
+        src: java.io.InputStream,
+        body: okhttp3.ResponseBody,
+        head: ByteArray,
+        plan: UnwrapPlan,
+        out: java.io.OutputStream,
+        created: CompletableFuture<ByteArray?>
+    ): Boolean {
+        val isAudio = remote.contains("/audio/")
+        val payloadHead = head.copyOfRange(plan.headerSize, head.size)
+        if (plan.xorKey != null) applyXor(payloadHead, payloadHead.size, 0, plan.xorKey)
+        val sendHead = withPsiPrefix(payloadHead, isAudio)
+        val extra = sendHead.size - payloadHead.size
+        val upstreamLen = body.contentLength()
+        val payloadLen = if (upstreamLen >= 0) upstreamLen - plan.headerSize else -1L
+        val totalLen = if (payloadLen >= 0) payloadLen + extra else -1L
+        return finishStream(
+            remote, src, sendHead, plan.xorKey, payloadHead.size,
+            "video/mp2t", totalLen, isAudio, out, created
+        )
+    }
+
+    /**
+     * Write [sendHead] then the rest of [src] (optionally XOR-decoded) to the
+     * player while teeing a complete copy into the segment cache.
+     */
+    private fun finishStream(
+        remote: String,
+        src: java.io.InputStream,
+        sendHead: ByteArray,
+        xorKey: ByteArray?,
+        xorStart: Int,
+        mime: String,
+        totalLen: Long,
+        isAudio: Boolean,
+        out: java.io.OutputStream,
+        created: CompletableFuture<ByteArray?>
+    ): Boolean {
+        val chunked = totalLen < 0
+        val tee = java.io.ByteArrayOutputStream(maxOf(4096, sendHead.size * 4))
+        val header = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: $mime\r\n")
+            if (chunked) append("Transfer-Encoding: chunked\r\n")
+            else append("Content-Length: $totalLen\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            append("Cache-Control: public, max-age=3600\r\n")
+            append("Connection: close\r\n\r\n")
+        }
+        out.write(header.toByteArray(Charsets.US_ASCII))
+        var xorIndex = xorStart
+        try {
+            tee.write(sendHead)
+            writeStreamChunk(out, sendHead, sendHead.size, chunked)
+            out.flush()
+            val buf = ByteArray(32 * 1024)
+            while (true) {
+                val n = src.read(buf)
+                if (n < 0) break
+                if (n == 0) continue
+                if (xorKey != null) {
+                    applyXor(buf, n, xorIndex, xorKey)
+                    xorIndex += n
+                }
+                tee.write(buf, 0, n)
+                writeStreamChunk(out, buf, n, chunked)
+                out.flush()
+            }
+            if (chunked) out.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            out.flush()
+            Log.i(TAG, "streamed ${segmentIdentityKey(remote).substringAfterLast('/')} ${tee.size()}b $mime")
+        } catch (e: Exception) {
+            Log.w(TAG, "client gone mid-stream: ${e.message}")
+            created.complete(null)
+            return true
+        }
+        var cleaned = tee.toByteArray()
+        if (!chunked && cleaned.size.toLong() != totalLen) {
+            created.complete(null)
+            return true
+        }
+        cleaned = prepareForPlayer(cleaned, isAudio)
+        rememberSegment(remote, cleaned)
+        created.complete(cleaned)
+        return true
     }
 
     private fun detectMimeType(data: ByteArray): String = when {
@@ -718,10 +859,9 @@ object LocalPlaylistServer {
         val rewritten = rewriteCdnHost(url)
         val noQuery = rewritten.substringBefore('?')
         val path = runCatching { java.net.URL(noQuery).path }.getOrNull() ?: noQuery
-        val isAudio = path.contains("/audio/")
         val dir = path.substringBeforeLast('/')
         val segNum = Regex("seg-(\\d+)").find(path)?.groupValues?.get(1) ?: return path
-        return if (isAudio) "$dir/audio/seg-$segNum" else "$dir/seg-$segNum"
+        return "$dir/seg-$segNum"
     }
 
     private fun cachedSegment(remote: String): ByteArray? {
@@ -785,9 +925,13 @@ object LocalPlaylistServer {
             var bytes: ByteArray? = null
             for (candidate in segmentUrlVariants(primary)) {
                 // Abort candidate search if prefetch generation was cancelled
-                if (prefetchGen != null) {
-                    val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
-                    if (genRef.get() != prefetchGen) break
+                if (isPrefetch) {
+                    val wantSeg = segNumber(candidate)
+                    if (wantSeg != null && !isWanted(wantSeg, isAudio)) break
+                    if (prefetchGen != null) {
+                        val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+                        if (genRef.get() != prefetchGen) break
+                    }
                 }
 
                 bytes = fetchViaOkHttp(candidate, session, isPrefetch, isAudio)
@@ -866,32 +1010,53 @@ object LocalPlaylistServer {
     private fun nextSegmentUrl(url: String, targetSeg: Int): String =
         url.replaceFirst(Regex("seg-\\d+"), "seg-$targetSeg")
 
+    private fun laneLookahead(isAudio: Boolean): Int {
+        val urgent = (if (isAudio) audioUrgent else videoUrgent).get() > 0
+        return if (isAudio) {
+            if (urgent) 3 else 10
+        } else {
+            if (urgent) 2 else 8
+        }
+    }
+
+    private fun isWanted(seg: Int, isAudio: Boolean): Boolean {
+        val head = (if (isAudio) playHeadAudio else playHeadVideo).get()
+        if (head < 0) return false
+        return seg in (head - 1).coerceAtLeast(0)..(head + laneLookahead(isAudio))
+    }
+
     /**
      * Called whenever a segment is actively played/requested by ExoPlayer.
-     * Updates playHead. If user seeked or jumped, cancels ALL stale prefetch
-     * downloads and bumps the generation; otherwise smoothly extends the
-     * parallel prefetch ahead without interrupting in-flight downloads.
+     * Updates playHead. Near seeks keep in-window prefetch; far seeks cancel
+     * the lane so the new target gets the bandwidth.
      */
-    private fun onSegmentPlayed(url: String, session: Session) {
+    private fun onSegmentPlayed(url: String, session: Session, kickPrefetch: Boolean = true) {
         val n = segNumber(url) ?: return
         val isAudio = url.contains("/audio/")
         val headRef = if (isAudio) playHeadAudio else playHeadVideo
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+        val calls = if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls
 
         if (isAudio) lastAudioUrl = url else lastVideoUrl = url
 
         val prev = headRef.getAndSet(n)
+        val farThreshold = if (isAudio) 10 else 8
         val isSeek = prev < 0 || kotlin.math.abs(n - prev) > 2
+        val farSeek = prev >= 0 && kotlin.math.abs(n - prev) > farThreshold
 
-        if (isSeek) {
-            // Cancel every stale prefetch download immediately so the seek
-            // target gets the full available bandwidth.
-            (if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls)
-                .forEach { it.cancel() }
+        if (farSeek) {
+            Log.i(TAG, "seek ${if (isAudio) "audio" else "video"} $prev -> $n (far)")
+            calls.keys.forEach { it.cancel() }
             genRef.incrementAndGet()
+        } else if (isSeek) {
+            Log.i(TAG, "seek ${if (isAudio) "audio" else "video"} $prev -> $n (near)")
+            val keepTo = n + laneLookahead(isAudio)
+            calls.forEach { (call, seg) ->
+                if (seg < n - 1 || seg > keepTo) call.cancel()
+            }
         }
 
-        schedulePrefetchLane(session, isAudio)
+        if (kickPrefetch) schedulePrefetchLane(session, isAudio)
     }
 
     /**
@@ -936,24 +1101,25 @@ object LocalPlaylistServer {
         val baseUrl = (if (isAudio) lastAudioUrl else lastVideoUrl) ?: return
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
         val slots = if (isAudio) audioDownloadSlots else videoDownloadSlots
-        val maxLookahead = if (isAudio) 10 else 8
+        val maxLookahead = laneLookahead(isAudio)
 
         for (delta in 1..maxLookahead) {
-            if (genRef.get() != gen) return // Abort if seeked or playhead moved
+            if (genRef.get() != gen) return
 
             val targetSeg = currentSeg + delta
+            if (!isWanted(targetSeg, isAudio)) continue
             val nextUrl = nextSegmentUrl(baseUrl, targetSeg)
 
             if (cachedSegment(nextUrl) != null) continue
 
             slots.acquireUninterruptibly()
-            if (genRef.get() != gen) {
+            if (genRef.get() != gen || !isWanted(targetSeg, isAudio)) {
                 slots.release()
-                return
+                continue
             }
             prefetchPool.execute {
                 try {
-                    if (genRef.get() != gen) return@execute
+                    if (genRef.get() != gen || !isWanted(targetSeg, isAudio)) return@execute
                     val raw = fetchBytes(
                         nextUrl,
                         session,
@@ -961,9 +1127,9 @@ object LocalPlaylistServer {
                         prefetchGen = gen,
                         isAudio = isAudio
                     ) ?: return@execute
-                    if (genRef.get() != gen) return@execute
+                    if (genRef.get() != gen || !isWanted(targetSeg, isAudio)) return@execute
                     val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
-                    rememberSegment(nextUrl, cleaned)
+                    rememberSegment(nextUrl, prepareForPlayer(cleaned, isAudio))
                     Log.i(
                         TAG,
                         "prefetched seg-$targetSeg (${if (isAudio) "audio" else "video"}) ${cleaned.size}b"
@@ -996,7 +1162,8 @@ object LocalPlaylistServer {
 
         val call = httpClient.newCall(req)
         if (isPrefetch) {
-            (if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls).add(call)
+            val map = if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls
+            map[call] = segNumber(url) ?: -1
         }
 
         return try {
@@ -1051,8 +1218,98 @@ object LocalPlaylistServer {
     }
 
     private fun extractMedia(data: ByteArray): ByteArray? {
-        if (strictTs(data) || looksLikeFmp4(data) || looksLikeAdts(data)) return data
-        return null
+        if (looksLikeFmp4(data) || looksLikeAdts(data)) return data
+        val start = findStrictTsStart(data) ?: return null
+        if (start == 0) return data
+        val aligned = ((data.size - start) / 188) * 188
+        if (aligned < 188 * 5) return null
+        return data.copyOfRange(start, start + aligned)
+    }
+
+    private fun tsPid(ts: ByteArray, off: Int): Int {
+        if (off + 3 > ts.size) return -1
+        return ((ts[off + 1].toInt() and 0x1f) shl 8) or (ts[off + 2].toInt() and 0xff)
+    }
+
+    /** PAT + PMT packets at the start of a well-formed HLS TS segment. */
+    private fun extractPsiPrefix(ts: ByteArray): ByteArray? {
+        if (ts.size < 376 || ts[0] != 0x47.toByte()) return null
+        if (tsPid(ts, 0) != 0) return null
+        val pmtPid = pmtPidFromPatPacket(ts, 0)
+        if (pmtPid <= 0) return null
+        var end = 0
+        var i = 0
+        val limit = minOf(ts.size, 188 * 12)
+        var sawPmt = false
+        while (i + 188 <= limit) {
+            if (ts[i] != 0x47.toByte()) break
+            when (val pid = tsPid(ts, i)) {
+                0 -> end = i + 188
+                0x1fff -> { }
+                pmtPid -> {
+                    sawPmt = true
+                    end = i + 188
+                }
+                else -> break
+            }
+            i += 188
+        }
+        return if (sawPmt && end >= 376) ts.copyOfRange(0, end) else null
+    }
+
+    private fun pmtPidFromPatPacket(ts: ByteArray, off: Int): Int {
+        if (off + 16 > ts.size) return -1
+        val afc = (ts[off + 3].toInt() shr 4) and 0x03
+        var p = off + 4
+        if (afc == 2 || afc == 3) {
+            if (p >= off + 188) return -1
+            val afLen = ts[p].toInt() and 0xff
+            p += 1 + afLen
+        }
+        if (p >= off + 188) return -1
+        if ((ts[off + 1].toInt() and 0x40) != 0) {
+            val pointer = ts[p].toInt() and 0xff
+            p += 1 + pointer
+        }
+        if (p + 12 > off + 188 || p + 12 > ts.size) return -1
+        if (ts[p].toInt() != 0) return -1
+        val sectionLen = ((ts[p + 1].toInt() and 0x0f) shl 8) or (ts[p + 2].toInt() and 0xff)
+        var o = p + 8
+        val sectionEnd = minOf(p + 3 + sectionLen - 4, off + 188, ts.size)
+        while (o + 4 <= sectionEnd) {
+            val prog = ((ts[o].toInt() and 0xff) shl 8) or (ts[o + 1].toInt() and 0xff)
+            val pid = ((ts[o + 2].toInt() and 0x1f) shl 8) or (ts[o + 3].toInt() and 0xff)
+            if (prog != 0) return pid
+            o += 4
+        }
+        return -1
+    }
+
+    /** Cache PAT/PMT from segments that have it; prepend it when a later segment omits PSI. */
+    private fun withPsiPrefix(ts: ByteArray, isAudio: Boolean): ByteArray {
+        if (ts.size < 188 || ts[0] != 0x47.toByte()) return ts
+        val slot = if (isAudio) tsPsiAudio else tsPsiVideo
+        if (tsPid(ts, 0) == 0) {
+            extractPsiPrefix(ts)?.let { slot.compareAndSet(null, it) }
+            return ts
+        }
+        val prefix = slot.get() ?: return ts
+        val out = ByteArray(prefix.size + ts.size)
+        System.arraycopy(prefix, 0, out, 0, prefix.size)
+        System.arraycopy(ts, 0, out, prefix.size, ts.size)
+        return out
+    }
+
+    private fun prepareForPlayer(data: ByteArray, isAudio: Boolean): ByteArray {
+        if (looksLikeFmp4(data) || looksLikeAdts(data)) return data
+        val start = findStrictTsStart(data) ?: return data
+        var ts = data
+        if (start > 0) {
+            val aligned = ((data.size - start) / 188) * 188
+            if (aligned < 188 * 5) return data
+            ts = data.copyOfRange(start, start + aligned)
+        }
+        return withPsiPrefix(ts, isAudio)
     }
 
     /**
