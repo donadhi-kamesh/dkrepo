@@ -8,17 +8,21 @@ import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 
 /**
@@ -62,14 +66,34 @@ object LocalPlaylistServer {
     private val videoPrefetchGen = AtomicInteger(0)
     private val audioPrefetchGen = AtomicInteger(0)
 
+    // Last played segment URL per lane — the template for nextSegmentUrl()
     @Volatile
-    private var activeVideoPrefetchCall: Call? = null
+    private var lastVideoUrl: String? = null
 
     @Volatile
-    private var activeAudioPrefetchCall: Call? = null
+    private var lastAudioUrl: String? = null
 
-    // 2-thread pool: 1 lane for sequential video prefetch, 1 lane for sequential audio prefetch
-    private val prefetchPool = Executors.newFixedThreadPool(2) { r ->
+    // All in-flight prefetch calls per lane, so a seek can cancel EVERY stale
+    // download at once and free full bandwidth for the seek target.
+    private val activeVideoPrefetchCalls =
+        Collections.newSetFromMap(ConcurrentHashMap<Call, Boolean>())
+    private val activeAudioPrefetchCalls =
+        Collections.newSetFromMap(ConcurrentHashMap<Call, Boolean>())
+
+    // The CDN throttles each TCP connection to ~250KB/s, so prefetch runs
+    // several parallel connections per lane: 3 video + 2 audio.
+    private val videoDownloadSlots = Semaphore(3)
+    private val audioDownloadSlots = Semaphore(2)
+
+    // One scheduler loop per lane; the retrigger flag avoids task pile-up and
+    // revives the lane after a seek aborts the previous pass.
+    private val videoLaneBusy = AtomicBoolean(false)
+    private val audioLaneBusy = AtomicBoolean(false)
+    private val videoRetrigger = AtomicBoolean(false)
+    private val audioRetrigger = AtomicBoolean(false)
+
+    // Workers: 3 video + 2 audio parallel downloads + 2 lane schedulers + headroom
+    private val prefetchPool = Executors.newFixedThreadPool(8) { r ->
         Thread(r, "FlixCloud-Prefetch").apply { isDaemon = true }
     }
 
@@ -93,6 +117,11 @@ object LocalPlaylistServer {
         OkHttpClient.Builder()
             .dispatcher(dispatcher)
             .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
+            // HTTP/2 multiplexing funnels every request through ONE throttled
+            // TCP connection (~250KB/s per connection). Forcing HTTP/1.1 makes
+            // each parallel prefetch request open its own connection so the
+            // aggregate throughput scales with parallelism.
+            .protocols(Collections.singletonList(Protocol.HTTP_1_1))
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
@@ -164,8 +193,8 @@ object LocalPlaylistServer {
         playHeadAudio.set(-1)
         videoPrefetchGen.incrementAndGet()
         audioPrefetchGen.incrementAndGet()
-        activeVideoPrefetchCall?.cancel()
-        activeAudioPrefetchCall?.cancel()
+        activeVideoPrefetchCalls.forEach { it.cancel() }
+        activeAudioPrefetchCalls.forEach { it.cancel() }
         val sessionId = UUID.randomUUID().toString().replace("-", "")
         val session = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
         sessions[sessionId] = session
@@ -174,25 +203,31 @@ object LocalPlaylistServer {
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
         trimMaps()
 
-        // Pre-warm initial segment in background for instant playback start (<100ms)
-        prefetchPool.execute {
-            try {
-                val lines = body.lines().map { it.trim() }
-                val initialSeg = lines.firstOrNull { it.isNotEmpty() && !it.startsWith("#") && !it.contains(".m3u8") }
-                if (initialSeg != null) {
-                    val raw = fetchBytes(initialSeg, session, isPrefetch = true)
-                    if (raw != null) {
-                        val cleaned = normalizeSegment(raw, session.xorKey)
-                        if (cleaned != null) {
-                            rememberSegment(initialSeg, cleaned)
-                            Log.i(TAG, "pre-warmed initial segment ${cleaned.size}b")
-                        }
-                    }
-                }
-            } catch (_: Exception) {}
-        }
+        // Pre-warm the first segments in PARALLEL for instant playback start.
+        // (Master playlists usually expose no segments here; servePlaylist warms
+        // media playlists the moment ExoPlayer fetches them.)
+        body.lines().asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") && !it.contains(".m3u8") }
+            .take(3)
+            .forEach { prewarmSegment(it, session) }
 
         return "http://127.0.0.1:$p/$id.m3u8"
+    }
+
+    /** Download one segment into cache in the background. Safe to spam — deduped by the inflight map. */
+    private fun prewarmSegment(seg: String, session: Session) {
+        prefetchPool.execute {
+            try {
+                if (cachedSegment(seg) != null) return@execute
+                val isAudio = seg.contains("/audio/")
+                val raw = fetchBytes(seg, session, isPrefetch = true, isAudio = isAudio) ?: return@execute
+                val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
+                rememberSegment(seg, cleaned)
+                Log.i(TAG, "pre-warmed ${seg.substringBefore('?').substringAfterLast('/')} ${cleaned.size}b")
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun rewritePlaylist(
@@ -348,6 +383,14 @@ object LocalPlaylistServer {
         val rewritten = rewritePlaylist(vod, sessionId, port)
         val bytes = rewritten.toByteArray(Charsets.UTF_8)
         playlistBodyCache.put(cacheKey, bytes)
+        // Kick off parallel prewarm of the first segments the moment ExoPlayer
+        // fetches the media playlist — BEFORE it even requests segment #1.
+        // This is what makes both initial load and seeks feel instant.
+        vod.lines().asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .take(3)
+            .forEach { prewarmSegment(it, session) }
         writeResponse(out, 200, "application/vnd.apple.mpegurl", bytes, cache = true)
     }
 
@@ -662,8 +705,9 @@ object LocalPlaylistServer {
 
     /**
      * Called whenever a segment is actively played/requested by ExoPlayer.
-     * Updates playHead. If user seeked or jumped, cancels stale prefetch and starts fresh;
-     * otherwise smoothly extends prefetch ahead without interrupting in-flight downloads.
+     * Updates playHead. If user seeked or jumped, cancels ALL stale prefetch
+     * downloads and bumps the generation; otherwise smoothly extends the
+     * parallel prefetch ahead without interrupting in-flight downloads.
      */
     private fun onSegmentPlayed(url: String, session: Session) {
         val n = segNumber(url) ?: return
@@ -671,34 +715,64 @@ object LocalPlaylistServer {
         val headRef = if (isAudio) playHeadAudio else playHeadVideo
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
 
+        if (isAudio) lastAudioUrl = url else lastVideoUrl = url
+
         val prev = headRef.getAndSet(n)
         val isSeek = prev < 0 || kotlin.math.abs(n - prev) > 2
 
-        val gen = if (isSeek) {
-            // User seeked or jumped: cancel previous stale prefetch HTTP call immediately
-            if (isAudio) activeAudioPrefetchCall?.cancel() else activeVideoPrefetchCall?.cancel()
+        if (isSeek) {
+            // Cancel every stale prefetch download immediately so the seek
+            // target gets the full available bandwidth.
+            (if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls)
+                .forEach { it.cancel() }
             genRef.incrementAndGet()
-        } else {
-            genRef.get()
         }
 
+        schedulePrefetchLane(session, isAudio)
+    }
+
+    /**
+     * Ensures exactly one scheduler loop runs per lane. Extra triggers while
+     * the lane is busy just set a retrigger flag; the loop re-reads the current
+     * playhead/generation on every pass, so it self-heals after seeks.
+     */
+    private fun schedulePrefetchLane(session: Session, isAudio: Boolean) {
+        val busyRef = if (isAudio) audioLaneBusy else videoLaneBusy
+        val retriggerRef = if (isAudio) audioRetrigger else videoRetrigger
+        if (!busyRef.compareAndSet(false, true)) {
+            retriggerRef.set(true)
+            return
+        }
         prefetchPool.execute {
-            runPrefetchLoop(url, session, n, isAudio, gen)
+            try {
+                while (true) {
+                    val headRef = if (isAudio) playHeadAudio else playHeadVideo
+                    val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+                    val n = headRef.get()
+                    if (n >= 0) runPrefetchLoop(session, n, isAudio, genRef.get())
+                    if (!retriggerRef.compareAndSet(true, false)) break
+                }
+            } finally {
+                busyRef.set(false)
+            }
         }
     }
 
     /**
-     * Sequentially prefetches upcoming segments (1 at a time) to keep 8-10 segments (~25-30s)
-     * of buffer ready in cache without overwhelming the CDN or network.
+     * Prefetches upcoming segments in PARALLEL (3 video / 2 audio connections)
+     * so the cache stays ahead of playback even when the CDN throttles each
+     * connection to ~250KB/s. Aborts instantly on seek via generation checks.
+     * Keeps ~8-10 segments (~25-30s) of buffer ready.
      */
     private fun runPrefetchLoop(
-        baseUrl: String,
         session: Session,
         currentSeg: Int,
         isAudio: Boolean,
         gen: Int
     ) {
+        val baseUrl = (if (isAudio) lastAudioUrl else lastVideoUrl) ?: return
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
+        val slots = if (isAudio) audioDownloadSlots else videoDownloadSlots
         val maxLookahead = if (isAudio) 10 else 8
 
         for (delta in 1..maxLookahead) {
@@ -709,23 +783,32 @@ object LocalPlaylistServer {
 
             if (cachedSegment(nextUrl) != null) continue
 
-            try {
-                val raw = fetchBytes(
-                    nextUrl,
-                    session,
-                    isPrefetch = true,
-                    prefetchGen = gen,
-                    isAudio = isAudio
-                ) ?: continue
-
-                if (genRef.get() != gen) return
-                val cleaned = normalizeSegment(raw, session.xorKey) ?: continue
-                rememberSegment(nextUrl, cleaned)
-                Log.i(
-                    TAG,
-                    "prefetched seg-$targetSeg (${if (isAudio) "audio" else "video"}) ${cleaned.size}b"
-                )
-            } catch (_: Exception) {
+            slots.acquireUninterruptibly()
+            if (genRef.get() != gen) {
+                slots.release()
+                return
+            }
+            prefetchPool.execute {
+                try {
+                    if (genRef.get() != gen) return@execute
+                    val raw = fetchBytes(
+                        nextUrl,
+                        session,
+                        isPrefetch = true,
+                        prefetchGen = gen,
+                        isAudio = isAudio
+                    ) ?: return@execute
+                    if (genRef.get() != gen) return@execute
+                    val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
+                    rememberSegment(nextUrl, cleaned)
+                    Log.i(
+                        TAG,
+                        "prefetched seg-$targetSeg (${if (isAudio) "audio" else "video"}) ${cleaned.size}b"
+                    )
+                } catch (_: Exception) {
+                } finally {
+                    slots.release()
+                }
             }
         }
     }
@@ -750,7 +833,7 @@ object LocalPlaylistServer {
 
         val call = httpClient.newCall(req)
         if (isPrefetch) {
-            if (isAudio) activeAudioPrefetchCall = call else activeVideoPrefetchCall = call
+            (if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls).add(call)
         }
 
         return try {
@@ -776,11 +859,7 @@ object LocalPlaylistServer {
             null
         } finally {
             if (isPrefetch) {
-                if (isAudio) {
-                    if (activeAudioPrefetchCall === call) activeAudioPrefetchCall = null
-                } else {
-                    if (activeVideoPrefetchCall === call) activeVideoPrefetchCall = null
-                }
+                (if (isAudio) activeAudioPrefetchCalls else activeVideoPrefetchCalls).remove(call)
             }
         }
     }
