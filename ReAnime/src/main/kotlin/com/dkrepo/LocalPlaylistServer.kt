@@ -50,7 +50,7 @@ object LocalPlaylistServer {
     private val nestedPlaylistUrls = ConcurrentHashMap<String, String>()
 
     // Bounded LRU caches prevent memory thrashing and GC pauses
-    private val segmentCache = BoundedLruCache<String, ByteArray>(32)
+    private val segmentCache = BoundedLruCache<String, ByteArray>(64)
     private val playlistBodyCache = BoundedLruCache<String, ByteArray>(16)
 
     // In-flight deduplication keyed by canonical segment identity
@@ -642,7 +642,8 @@ object LocalPlaylistServer {
 
     /**
      * Called whenever a segment is actively played/requested by ExoPlayer.
-     * Updates playHead, increments generation, and cancels previous stale prefetch downloads.
+     * Updates playHead. If user seeked or jumped, cancels stale prefetch and starts fresh;
+     * otherwise smoothly extends prefetch ahead without interrupting in-flight downloads.
      */
     private fun onSegmentPlayed(url: String, session: Session) {
         val n = segNumber(url) ?: return
@@ -650,14 +651,15 @@ object LocalPlaylistServer {
         val headRef = if (isAudio) playHeadAudio else playHeadVideo
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
 
-        headRef.set(n)
-        val gen = genRef.incrementAndGet()
+        val prev = headRef.getAndSet(n)
+        val isSeek = prev < 0 || kotlin.math.abs(n - prev) > 2
 
-        // Instantly cancel ongoing prefetch HTTP calls on seek or advance
-        if (isAudio) {
-            activeAudioPrefetchCall?.cancel()
+        val gen = if (isSeek) {
+            // User seeked or jumped: cancel previous stale prefetch HTTP call immediately
+            if (isAudio) activeAudioPrefetchCall?.cancel() else activeVideoPrefetchCall?.cancel()
+            genRef.incrementAndGet()
         } else {
-            activeVideoPrefetchCall?.cancel()
+            genRef.get()
         }
 
         prefetchPool.execute {
@@ -666,7 +668,7 @@ object LocalPlaylistServer {
     }
 
     /**
-     * Sequentially prefetches upcoming segments (1 at a time) to keep 3-4 segments (~10s)
+     * Sequentially prefetches upcoming segments (1 at a time) to keep 8-10 segments (~25-30s)
      * of buffer ready in cache without overwhelming the CDN or network.
      */
     private fun runPrefetchLoop(
@@ -677,7 +679,7 @@ object LocalPlaylistServer {
         gen: Int
     ) {
         val genRef = if (isAudio) audioPrefetchGen else videoPrefetchGen
-        val maxLookahead = if (isAudio) 4 else 3
+        val maxLookahead = if (isAudio) 10 else 8
 
         for (delta in 1..maxLookahead) {
             if (genRef.get() != gen) return // Abort if seeked or playhead moved

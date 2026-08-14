@@ -8,7 +8,11 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
+import java.util.Collections
 
 class ReAnimeProvider : MainAPI() {
     override var mainUrl = "https://reanime.to"
@@ -90,10 +94,27 @@ class ReAnimeProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val animeId = url.removePrefix("$mainUrl/anime/").removePrefix("$mainUrl/watch/")
             .substringBefore("?").substringBefore("/")
-        val details = parseApi(
-            app.get("$mainUrl/api/v1/anime/$animeId").text,
-            AnimeDetailsResponse::class.java
-        )
+
+        // Parallelize details and full episode list fetch
+        val (details, episodes) = coroutineScope {
+            val detailsDef = async {
+                parseApi(
+                    app.get("$mainUrl/api/v1/anime/$animeId").text,
+                    AnimeDetailsResponse::class.java
+                )
+            }
+            val episodesDef = async {
+                try {
+                    parseApi(
+                        app.get("$mainUrl/api/v1/anime/$animeId/episodes?limit=5000").text,
+                        EpisodesResponse::class.java
+                    ).data ?: emptyList()
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            }
+            detailsDef.await() to episodesDef.await()
+        }
 
         val title = details.title?.english?.ifEmpty { null }
             ?: details.title?.romaji?.ifEmpty { null }
@@ -116,16 +137,6 @@ class ReAnimeProvider : MainAPI() {
         val tmdbId = details.themoviedbId ?: 0
         val tmdbSeason = details.externalSeasons?.tmdb?.takeIf { it > 0 } ?: 1
         Log.i("ReAnime", "load details animeId=$animeId anilistId=$anilistId tmdbId=$tmdbId season=$tmdbSeason title=${title.take(40)}")
-
-        // full episode list (single request, high limit)
-        val episodes = try {
-            parseApi(
-                app.get("$mainUrl/api/v1/anime/$animeId/episodes?limit=5000").text,
-                EpisodesResponse::class.java
-            ).data ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
-        }
 
         fun epData(epNum: Int) = "$animeId|$anilistId|$tmdbId|$tmdbSeason|$epNum"
 
@@ -188,6 +199,7 @@ class ReAnimeProvider : MainAPI() {
             if (dubEpisodes.isNotEmpty()) addEpisodes(DubStatus.Dubbed, dubEpisodes)
         }
     }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -195,9 +207,6 @@ class ReAnimeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         Log.i("ReAnime", "loadLinks data=$data")
-        // episode data layouts:
-        // new: animeId|anilistId|tmdbId|tmdbSeason|episodeNumber
-        // old (cached): anilistId|tmdbId|tmdbSeason|episodeNumber
         val parts = data.split("|")
         var animeId = ""
         var anilistId: Int
@@ -245,29 +254,36 @@ class ReAnimeProvider : MainAPI() {
             val flixText = app.get(flixUrl).text
             Log.i("ReAnime", "flix api $flixUrl len=${flixText.length}")
             val parsed = parseApi(flixText, FlixResponse::class.java)
-            val seenLinks = HashSet<String>()
-            val seenSubs = HashSet<String>()
-            parsed.servers?.forEach { server ->
-                val link = server.dataLink ?: return@forEach
-                if (link.isBlank() || !seenLinks.add(link)) return@forEach
-                try {
-                    flixCloud.extract(
-                        url = link,
-                        subtitleCallback = { sub ->
-                            if (seenSubs.add(sub.url)) subtitleCallback(sub)
-                        },
-                        callback = { extractorLink ->
-                            found = true
-                            callback(extractorLink)
-                        },
-                        emitSubtitles = true,
-                        serverLabel = server.serverName
-                    )
-                } catch (e: Exception) {
-                    Log.w("ReAnime", "extractor failed for $link: ${e.javaClass.simpleName}: ${e.message}")
-                }
+            val servers = parsed.servers ?: emptyList()
+            val seenLinks = Collections.synchronizedSet(HashSet<String>())
+            val seenSubs = Collections.synchronizedSet(HashSet<String>())
+
+            // Parallel extraction across all servers
+            coroutineScope {
+                servers.map { server ->
+                    async {
+                        val link = server.dataLink ?: return@async
+                        if (link.isBlank() || !seenLinks.add(link)) return@async
+                        try {
+                            flixCloud.extract(
+                                url = link,
+                                subtitleCallback = { sub ->
+                                    if (seenSubs.add(sub.url)) subtitleCallback(sub)
+                                },
+                                callback = { extractorLink ->
+                                    found = true
+                                    callback(extractorLink)
+                                },
+                                emitSubtitles = true,
+                                serverLabel = server.serverName
+                            )
+                        } catch (e: Exception) {
+                            Log.w("ReAnime", "extractor failed for $link: ${e.javaClass.simpleName}: ${e.message}")
+                        }
+                    }
+                }.awaitAll()
             }
-            Log.i("ReAnime", "servers tried=${parsed.servers?.size ?: 0} found=$found")
+            Log.i("ReAnime", "servers tried=${servers.size} found=$found")
         } catch (e: Exception) {
             Log.w("ReAnime", "loadLinks failed: ${e.javaClass.simpleName}: ${e.message}")
         }
