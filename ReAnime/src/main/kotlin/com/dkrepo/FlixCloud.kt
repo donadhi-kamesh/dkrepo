@@ -37,13 +37,15 @@ class FlixCloud : ExtractorApi() {
     override var mainUrl = "https://flixcloud.cc"
     override val requiresReferer = true
 
-    @Volatile
-    private var wasmKey: ByteArray? = null
-
     companion object {
         private const val TAG = "FlixCloud"
         const val PARENT_REFERER = "https://reanime.to/"
     }
+
+    data class DecryptResult(
+        val masterUrl: String,
+        val wasmKey: ByteArray?
+    )
 
     override suspend fun getUrl(
         url: String,
@@ -84,13 +86,15 @@ class FlixCloud : ExtractorApi() {
             }
         }
 
-        val masterUrl = decryptMasterUrl(data, url) ?: run {
+        val decryptResult = decryptMasterUrl(data, url) ?: run {
             Log.w(TAG, "decryption failed for $url")
             return
         }
+        val masterUrl = decryptResult.masterUrl
+        val wasmKey = decryptResult.wasmKey
         Log.i(TAG, "decrypted master url: ${masterUrl.take(90)}")
 
-        val masterText = fetchAndUnwrapPlaylist(masterUrl) ?: run {
+        val masterText = fetchAndUnwrapPlaylist(masterUrl, wasmKey) ?: run {
             Log.w(TAG, "master playlist fetch/unwrap failed for $masterUrl")
             return
         }
@@ -190,7 +194,7 @@ class FlixCloud : ExtractorApi() {
         }
     }
 
-    private suspend fun fetchAndUnwrapPlaylist(url: String): String? {
+    private suspend fun fetchAndUnwrapPlaylist(url: String, key: ByteArray?): String? {
         val headers = mapOf(
             "User-Agent" to USER_AGENT,
             "Origin" to mainUrl
@@ -208,8 +212,7 @@ class FlixCloud : ExtractorApi() {
                     ).text.trim()
                     if (raw.startsWith("#EXTM3U")) return raw
 
-                    val key = wasmKey
-                    if (key != null) {
+                    if (key != null && key.isNotEmpty()) {
                         val result = xorUnwrap(raw, key).trim()
                         if (result.startsWith("#EXTM3U")) return result
                     }
@@ -226,8 +229,8 @@ class FlixCloud : ExtractorApi() {
         return null
     }
 
-    /** Runs the whole decryption chain and returns the master m3u8 URL. */
-    private suspend fun decryptMasterUrl(data: Map<String, Any?>, embedUrl: String): String? {
+    /** Runs the whole decryption chain and returns the master m3u8 URL and wasm key. */
+    private suspend fun decryptMasterUrl(data: Map<String, Any?>, embedUrl: String): DecryptResult? {
         return try {
             val seed = data["obfuscation_seed"] as? String ?: run {
                 Log.w(TAG, "missing obfuscation_seed in data object (keys=${data.keys})")
@@ -285,9 +288,10 @@ class FlixCloud : ExtractorApi() {
             val d = interp.memory.copyOfRange(cp, cp + c)
 
             // keep the _c() key for encrypted-tier quality detection
+            var localWasmKey: ByteArray? = null
             runCatching {
                 val pkPtr = interp.call("_c", intArrayOf())
-                wasmKey = interp.memory.copyOfRange(pkPtr, pkPtr + 32)
+                localWasmKey = interp.memory.copyOfRange(pkPtr, pkPtr + 32)
             }
 
             // PBKDF2 -> XOR with seed -> SHA-256 => AES key
@@ -299,7 +303,7 @@ class FlixCloud : ExtractorApi() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
             val plain = String(cipher.doFinal(b64(ctB64)), Charsets.UTF_8).trim()
-            plain.takeIf { it.startsWith("http") }
+            if (plain.startsWith("http")) DecryptResult(plain, localWasmKey) else null
         } catch (e: Exception) {
             Log.w(TAG, "decryptMasterUrl failed: ${e.javaClass.simpleName}: ${e.message}")
             null

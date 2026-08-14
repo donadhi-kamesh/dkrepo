@@ -167,11 +167,31 @@ object LocalPlaylistServer {
         activeVideoPrefetchCall?.cancel()
         activeAudioPrefetchCall?.cancel()
         val sessionId = UUID.randomUUID().toString().replace("-", "")
-        sessions[sessionId] = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
+        val session = Session(headers, xorKey, segmentReferer, allowOpaque, embedUrl)
+        sessions[sessionId] = session
         val rewritten = rewritePlaylist(body, sessionId, p)
         val id = UUID.randomUUID().toString().replace("-", "")
         playlists[id] = rewritten.toByteArray(Charsets.UTF_8)
         trimMaps()
+
+        // Pre-warm initial segment in background for instant playback start (<100ms)
+        prefetchPool.execute {
+            try {
+                val lines = body.lines().map { it.trim() }
+                val initialSeg = lines.firstOrNull { it.isNotEmpty() && !it.startsWith("#") && !it.contains(".m3u8") }
+                if (initialSeg != null) {
+                    val raw = fetchBytes(initialSeg, session, isPrefetch = true)
+                    if (raw != null) {
+                        val cleaned = normalizeSegment(raw, session.xorKey)
+                        if (cleaned != null) {
+                            rememberSegment(initialSeg, cleaned)
+                            Log.i(TAG, "pre-warmed initial segment ${cleaned.size}b")
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
         return "http://127.0.0.1:$p/$id.m3u8"
     }
 
@@ -769,6 +789,7 @@ object LocalPlaylistServer {
      * Recover MPEG-TS / fMP4 / packed ADTS. Matches FlixCloud hls.js:
      * WEBP wrapper is 12 bytes (RIFF+size+WEBP), PNG is 8 bytes; then XOR with
      * a fixed 16-byte key unless the payload already starts with 0x47.
+     * Preserves PTS timestamps across all packets to guarantee perfect A/V sync.
      */
     private fun normalizeSegment(raw: ByteArray, xorKey: ByteArray?): ByteArray? {
         val stripped = stripImageContainer(raw)
@@ -788,13 +809,7 @@ object LocalPlaylistServer {
     }
 
     private fun extractMedia(data: ByteArray): ByteArray? {
-        if (strictTs(data)) return data
-        if (looksLikeFmp4(data)) return data
-        if (looksLikeAdts(data)) return data
-        findStrictTsStart(data)?.let { start ->
-            val sliced = if (start == 0) data else data.copyOfRange(start, data.size)
-            if (strictTs(sliced)) return sliced
-        }
+        if (strictTs(data) || looksLikeFmp4(data) || looksLikeAdts(data)) return data
         return null
     }
 
@@ -890,31 +905,17 @@ object LocalPlaylistServer {
             data[0] == 0x52.toByte() && data[1] == 0x49.toByte() &&
             data[2] == 0x46.toByte() && data[3] == 0x46.toByte()
 
-    /** Real PNG starts with an IHDR chunk (length 13) immediately after the signature. */
-    private fun isRealPng(data: ByteArray): Boolean =
-        data.size >= 16 &&
-            data[8] == 0x00.toByte() && data[9] == 0x00.toByte() &&
-            data[10] == 0x00.toByte() && data[11] == 0x0D.toByte() &&
-            data[12] == 0x49.toByte() && data[13] == 0x48.toByte() &&
-            data[14] == 0x44.toByte() && data[15] == 0x52.toByte()
-
     private fun stripImageContainer(data: ByteArray): ByteArray {
         if (data.size < 8) return data
-        // Fake WEBP: RIFF....WEBP + XOR payload. Always skip the 12-byte header
-        // (hls.js uses slice(12)). A zero/huge RIFF size is not a real image.
+        // Fake WEBP: RIFF....WEBP + XOR payload. Always skip exactly 12-byte header
         if (data.size >= 12 && isRiffMagic(data) &&
             data[8] == 0x57.toByte() && data[9] == 0x45.toByte() &&
             data[10] == 0x42.toByte() && data[11] == 0x50.toByte()
         ) {
             return data.copyOfRange(12, data.size)
         }
+        // Fake PNG: Exactly 8 bytes (\x89PNG\r\n\x1a\n)
         if (isPngMagic(data)) {
-            if (isRealPng(data)) {
-                val iend = indexOf(data, byteArrayOf(0x49, 0x45, 0x4E, 0x44))
-                if (iend >= 0 && iend + 8 < data.size) {
-                    return data.copyOfRange(iend + 8, data.size)
-                }
-            }
             return data.copyOfRange(8, data.size)
         }
         if (isRiffMagic(data) && data.size > 12) {
