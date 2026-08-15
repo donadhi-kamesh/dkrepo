@@ -54,8 +54,9 @@ object LocalPlaylistServer {
     private val sessions = ConcurrentHashMap<String, Session>()
     private val nestedPlaylistUrls = ConcurrentHashMap<String, String>()
 
-    // Bounded LRU caches prevent memory thrashing and GC pauses
-    private val segmentCache = BoundedLruCache<String, ByteArray>(64)
+    // 32 segments covers 8 video + 10 audio lookahead without the 120MB+ heap
+    // that was stalling the UI (Skipped 101 frames / 126MB in the v6 logcat).
+    private val segmentCache = BoundedLruCache<String, ByteArray>(32)
     private val playlistBodyCache = BoundedLruCache<String, ByteArray>(16)
 
     // In-flight deduplication keyed by canonical segment identity
@@ -83,11 +84,6 @@ object LocalPlaylistServer {
     // sometimes omit PSI, which makes ExoPlayer hang on seek (endless buffer).
     private val tsPsiVideo = AtomicReference<ByteArray?>(null)
     private val tsPsiAudio = AtomicReference<ByteArray?>(null)
-
-    // Player is fetching a cold playhead segment — keep lookahead short so the
-    // seek target is not starved by 8 extra CDN connections.
-    private val videoUrgent = AtomicInteger(0)
-    private val audioUrgent = AtomicInteger(0)
 
     // The CDN throttles each TCP connection to ~250KB/s, so prefetch runs
     // several parallel connections per lane: 3 video + 2 audio.
@@ -222,7 +218,7 @@ object LocalPlaylistServer {
         body.lines().asSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("#") && !it.contains(".m3u8") }
-            .take(3)
+            .take(6)
             .forEach { prewarmSegment(it, session) }
 
         return "http://127.0.0.1:$p/$id.m3u8"
@@ -236,7 +232,7 @@ object LocalPlaylistServer {
                 val isAudio = seg.contains("/audio/")
                 val raw = fetchBytes(seg, session, isPrefetch = true, isAudio = isAudio) ?: return@execute
                 val cleaned = normalizeSegment(raw, session.xorKey) ?: return@execute
-                rememberSegment(seg, cleaned)
+                rememberSegment(seg, prepareForPlayer(cleaned, isAudio))
                 Log.i(TAG, "pre-warmed ${seg.substringBefore('?').substringAfterLast('/')} ${cleaned.size}b")
             } catch (_: Exception) {
             }
@@ -406,7 +402,7 @@ object LocalPlaylistServer {
         vod.lines().asSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("#") }
-            .take(3)
+            .take(6)
             .forEach { prewarmSegment(it, session) }
         writeResponse(out, 200, "application/vnd.apple.mpegurl", bytes, cache = true)
     }
@@ -510,17 +506,13 @@ object LocalPlaylistServer {
             return
         }
 
-        // Update playhead / cancel stale prefetch immediately, but keep
-        // lookahead short until this cold segment is in cache.
-        val isAudio = remote.contains("/audio/")
-        val urgentRef = if (isAudio) audioUrgent else videoUrgent
-        urgentRef.incrementAndGet()
+        // Kick prefetch of N+1.. now, in parallel with this cold download.
+        // Do NOT stream PNG-wrapped bodies to ExoPlayer: the CDN is ~250KB/s
+        // per connection and 1080p needs more than that, so trickle-play
+        // underruns after a few seconds (inputFps=3 outputFps=0 in logcat).
+        // Fully unwrap, then serve from memory while lookahead fills the cache.
         onSegmentPlayed(remote, session, kickPrefetch = true)
         try {
-            // Cold segment: unwrap PNG/WEBP+XOR on the fly so ExoPlayer sees
-            // the first TS packets in milliseconds instead of after 1–2MB.
-            if (tryServeStreaming(remote, session, out)) return
-
             val raw = fetchBytes(remote, session, isPrefetch = false)
             if (!serveNormalizedBytes(remote, session, raw, out)) {
                 writeResponse(out, 502, "text/plain", ByteArray(0))
@@ -528,10 +520,8 @@ object LocalPlaylistServer {
         } catch (e: Exception) {
             Log.w(TAG, "serveSegment failed: ${e.message}")
             try { writeResponse(out, 502, "text/plain", ByteArray(0)) } catch (_: Exception) {}
-        } finally {
-            urgentRef.decrementAndGet()
-            schedulePrefetchLane(session, isAudio)
         }
+        schedulePrefetchLane(session, remote.contains("/audio/"))
     }
 
     /** Normalize a fetched (possibly disguised) segment and serve it buffered. */
@@ -583,267 +573,6 @@ object LocalPlaylistServer {
     }
 
 
-
-    /**
-     * Cold-segment fast path: open the upstream and peek the first bytes; if
-     * the body is already plain MPEG-TS / fMP4 / ADTS (no XOR / image
-     * disguise), stream it to ExoPlayer chunk-by-chunk WHILE it downloads —
-     * first byte arrives in milliseconds instead of after the whole throttled
-     * download — teeing the bytes into the segment cache. Disguised bodies
-     * fall back to buffered serving with the already-downloaded bytes.
-     * Returns false only when no upstream could be opened at all, so the
-     * caller can retry via [fetchBytes].
-     */
-    private fun tryServeStreaming(remote: String, session: Session, out: java.io.OutputStream): Boolean {
-        val token = session.segmentReferer
-            ?.substringAfter("token=", "")
-            ?.takeIf { it.isNotEmpty() }
-        val primary = v7FetchUrl(remote, token)
-        val identity = segmentIdentityKey(primary)
-        val ua = session.headers["User-Agent"] ?: "Mozilla/5.0"
-
-        fun openUpstream(): okhttp3.Response? {
-            for (candidate in segmentUrlVariants(primary)) {
-                val call = httpClient.newCall(
-                    Request.Builder()
-                        .url(rewriteCdnHost(candidate))
-                        .header("User-Agent", ua)
-                        .header("Accept", "*/*")
-                        .header("Referer", "https://flixcloud.cc/")
-                        .header("Origin", "https://flixcloud.cc")
-                        .get()
-                        .build()
-                )
-                try {
-                    val res = call.execute()
-                    if (res.isSuccessful) {
-                        rememberWorkingExt(candidate)
-                        return res
-                    }
-                    Log.w(TAG, "upstream HTTP ${res.code} url=${candidate.take(110)}")
-                    res.close()
-                } catch (e: Exception) {
-                    Log.w(TAG, "stream open failed ${candidate.take(80)}: ${e.message}")
-                }
-            }
-            return null
-        }
-
-        // Join an in-flight download (e.g. the playlist pre-warm) instead of
-        // opening a second throttled connection for the same segment.
-        fun awaitBuffered(f: CompletableFuture<ByteArray?>): Boolean = try {
-            val raw = f.get(25, TimeUnit.SECONDS)
-            serveNormalizedBytes(remote, session, raw, out)
-        } catch (e: Exception) {
-            Log.w(TAG, "streaming join failed: ${e.message}")
-            false
-        }
-
-        inflight[identity]?.let { return awaitBuffered(it) }
-        val created = CompletableFuture<ByteArray?>()
-        inflight.putIfAbsent(identity, created)?.let { return awaitBuffered(it) }
-
-        try {
-            val res = openUpstream() ?: run {
-                created.complete(null)
-                return false
-            }
-            res.use { r ->
-                val body = r.body ?: run { created.complete(null); return false }
-                val src = body.byteStream()
-
-                // Peek the first 1KB to decide between streaming pass-through
-                // (plain media) and the buffered normalize fallback.
-                val peek = java.io.ByteArrayOutputStream()
-                val small = ByteArray(1024)
-                while (peek.size() < 1024) {
-                    val n = src.read(small)
-                    if (n < 0) break
-                    peek.write(small, 0, n)
-                }
-                val head = peek.toByteArray()
-                if (head.isEmpty()) {
-                    created.complete(null)
-                    return false
-                }
-
-                if (strictTs(head) || looksLikeFmp4(head) || looksLikeAdts(head)) {
-                    return streamPlain(remote, src, body, head, out, created)
-                }
-
-                val plan = detectUnwrapPlan(head)
-                if (plan != null) {
-                    return streamUnwrapped(remote, src, body, head, plan, out, created)
-                }
-
-                // Unknown disguise: finish buffering, then normalize + serve.
-                val raw = head + src.readBytes()
-                created.complete(raw)
-                return serveNormalizedBytes(remote, session, raw, out)
-            }
-        } finally {
-            inflight.remove(identity, created)
-        }
-    }
-
-    private data class UnwrapPlan(val headerSize: Int, val xorKey: ByteArray?)
-
-    /** PNG/WEBP wrapper around TS (optionally XOR'd). Null if the peek is not a known disguise. */
-    private fun detectUnwrapPlan(head: ByteArray): UnwrapPlan? {
-        val headerSize = when {
-            head.size >= 12 && isRiffMagic(head) &&
-                head[8] == 0x57.toByte() && head[9] == 0x45.toByte() &&
-                head[10] == 0x42.toByte() && head[11] == 0x50.toByte() -> 12
-            isPngMagic(head) -> 8
-            isRiffMagic(head) && head.size > 12 -> 12
-            else -> return null
-        }
-        if (head.size <= headerSize + 188 * 3) return null
-        val payload = head.copyOfRange(headerSize, head.size)
-        if (looksLikeTsHead(payload)) return UnwrapPlan(headerSize, null)
-        val probeLen = minOf(payload.size, 188 * 5)
-        for (key in listOf(SEGMENT_XOR_KEY)) {
-            val probe = xorBytes(payload.copyOf(probeLen), key)
-            if (looksLikeTsHead(probe)) return UnwrapPlan(headerSize, key)
-        }
-        return null
-    }
-
-    private fun looksLikeTsHead(data: ByteArray): Boolean {
-        if (data.size < 188 * 3) return false
-        var i = 0
-        var count = 0
-        while (i + 188 <= data.size && count < 5) {
-            if (data[i] != 0x47.toByte()) return false
-            if ((data[i + 1].toInt() and 0x80) != 0) return false
-            count++
-            i += 188
-        }
-        return count >= 3
-    }
-
-    private fun applyXor(buf: ByteArray, len: Int, startIndex: Int, key: ByteArray) {
-        val ks = key.size
-        if (ks == 0) return
-        var i = 0
-        while (i < len) {
-            buf[i] = (buf[i].toInt() xor key[(startIndex + i) % ks].toInt()).toByte()
-            i++
-        }
-    }
-
-    private fun streamPlain(
-        remote: String,
-        src: java.io.InputStream,
-        body: okhttp3.ResponseBody,
-        head: ByteArray,
-        out: java.io.OutputStream,
-        created: CompletableFuture<ByteArray?>
-    ): Boolean {
-        val isAudio = remote.contains("/audio/")
-        var sendHead = head
-        var extra = 0
-        if (strictTs(head)) {
-            sendHead = withPsiPrefix(head, isAudio)
-            extra = sendHead.size - head.size
-        }
-        val mime = when {
-            looksLikeFmp4(head) -> "video/mp4"
-            looksLikeAdts(head) -> "audio/aac"
-            else -> "video/mp2t"
-        }
-        val contentLength = body.contentLength()
-        val totalLen = if (contentLength < 0) -1L else contentLength + extra
-        return finishStream(remote, src, sendHead, /*xorKey*/ null, /*xorIndex*/ 0, mime, totalLen, isAudio, out, created)
-    }
-
-    private fun streamUnwrapped(
-        remote: String,
-        src: java.io.InputStream,
-        body: okhttp3.ResponseBody,
-        head: ByteArray,
-        plan: UnwrapPlan,
-        out: java.io.OutputStream,
-        created: CompletableFuture<ByteArray?>
-    ): Boolean {
-        val isAudio = remote.contains("/audio/")
-        val payloadHead = head.copyOfRange(plan.headerSize, head.size)
-        if (plan.xorKey != null) applyXor(payloadHead, payloadHead.size, 0, plan.xorKey)
-        val sendHead = withPsiPrefix(payloadHead, isAudio)
-        val extra = sendHead.size - payloadHead.size
-        val upstreamLen = body.contentLength()
-        val payloadLen = if (upstreamLen >= 0) upstreamLen - plan.headerSize else -1L
-        val totalLen = if (payloadLen >= 0) payloadLen + extra else -1L
-        return finishStream(
-            remote, src, sendHead, plan.xorKey, payloadHead.size,
-            "video/mp2t", totalLen, isAudio, out, created
-        )
-    }
-
-    /**
-     * Write [sendHead] then the rest of [src] (optionally XOR-decoded) to the
-     * player while teeing a complete copy into the segment cache.
-     */
-    private fun finishStream(
-        remote: String,
-        src: java.io.InputStream,
-        sendHead: ByteArray,
-        xorKey: ByteArray?,
-        xorStart: Int,
-        mime: String,
-        totalLen: Long,
-        isAudio: Boolean,
-        out: java.io.OutputStream,
-        created: CompletableFuture<ByteArray?>
-    ): Boolean {
-        val chunked = totalLen < 0
-        val tee = java.io.ByteArrayOutputStream(maxOf(4096, sendHead.size * 4))
-        val header = buildString {
-            append("HTTP/1.1 200 OK\r\n")
-            append("Content-Type: $mime\r\n")
-            if (chunked) append("Transfer-Encoding: chunked\r\n")
-            else append("Content-Length: $totalLen\r\n")
-            append("Access-Control-Allow-Origin: *\r\n")
-            append("Cache-Control: public, max-age=3600\r\n")
-            append("Connection: close\r\n\r\n")
-        }
-        out.write(header.toByteArray(Charsets.US_ASCII))
-        var xorIndex = xorStart
-        try {
-            tee.write(sendHead)
-            writeStreamChunk(out, sendHead, sendHead.size, chunked)
-            out.flush()
-            val buf = ByteArray(32 * 1024)
-            while (true) {
-                val n = src.read(buf)
-                if (n < 0) break
-                if (n == 0) continue
-                if (xorKey != null) {
-                    applyXor(buf, n, xorIndex, xorKey)
-                    xorIndex += n
-                }
-                tee.write(buf, 0, n)
-                writeStreamChunk(out, buf, n, chunked)
-                out.flush()
-            }
-            if (chunked) out.write("0\r\n\r\n".toByteArray(Charsets.US_ASCII))
-            out.flush()
-            Log.i(TAG, "streamed ${segmentIdentityKey(remote).substringAfterLast('/')} ${tee.size()}b $mime")
-        } catch (e: Exception) {
-            Log.w(TAG, "client gone mid-stream: ${e.message}")
-            created.complete(null)
-            return true
-        }
-        var cleaned = tee.toByteArray()
-        if (!chunked && cleaned.size.toLong() != totalLen) {
-            created.complete(null)
-            return true
-        }
-        cleaned = prepareForPlayer(cleaned, isAudio)
-        rememberSegment(remote, cleaned)
-        created.complete(cleaned)
-        return true
-    }
 
     private fun detectMimeType(data: ByteArray): String = when {
         looksLikeFmp4(data) -> "video/mp4"
@@ -1010,14 +739,7 @@ object LocalPlaylistServer {
     private fun nextSegmentUrl(url: String, targetSeg: Int): String =
         url.replaceFirst(Regex("seg-\\d+"), "seg-$targetSeg")
 
-    private fun laneLookahead(isAudio: Boolean): Int {
-        val urgent = (if (isAudio) audioUrgent else videoUrgent).get() > 0
-        return if (isAudio) {
-            if (urgent) 3 else 10
-        } else {
-            if (urgent) 2 else 8
-        }
-    }
+    private fun laneLookahead(isAudio: Boolean): Int = if (isAudio) 10 else 8
 
     private fun isWanted(seg: Int, isAudio: Boolean): Boolean {
         val head = (if (isAudio) playHeadAudio else playHeadVideo).get()
@@ -1474,28 +1196,6 @@ object LocalPlaylistServer {
             i++
         }
         return null
-    }
-
-    private fun indexOf(data: ByteArray, needle: ByteArray): Int {
-        outer@ for (i in 0..data.size - needle.size) {
-            for (j in needle.indices) {
-                if (data[i + j] != needle[j]) continue@outer
-            }
-            return i
-        }
-        return -1
-    }
-
-    /** Write one HTTP body chunk, using chunked transfer framing when needed. */
-    private fun writeStreamChunk(out: java.io.OutputStream, buf: ByteArray, len: Int, chunked: Boolean) {
-        if (chunked) {
-            out.write(len.toString(16).toByteArray(Charsets.US_ASCII))
-            out.write("\r\n".toByteArray(Charsets.US_ASCII))
-            out.write(buf, 0, len)
-            out.write("\r\n".toByteArray(Charsets.US_ASCII))
-        } else {
-            out.write(buf, 0, len)
-        }
     }
 
     private fun writeResponse(
