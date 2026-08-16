@@ -1,5 +1,26 @@
 [
     {
+        "iconUrl": "https://www.google.com/s2/favicons?sz=64&domain=movieswood.cloud",
+        "fileHash": "sha256-cf6d8eb1fddbe6a222838190873a1bb96f0c79de9c03bd7e9198d234fbbde81d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/donadhi-kamesh/dkrepo",
+        "fileSize": 24348,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "dkrepo"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 1,
+        "internalName": "MoviesWood",
+        "description": "MoviesWood.cloud extension - Telugu/Tamil/Hindi/Dubbed movies & web series",
+        "url": "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/MoviesWood.cs3?v=1",
+        "name": "MoviesWood"
+    },
+    {
         "iconUrl": "https://reanime.to/favicon-32x32.png",
         "fileHash": "sha256-ac57ff7c8a778eed8dc054728965b25f15a51b75cda47c46cf4e8e496f2ae118",
         "apiVersion": 1,
