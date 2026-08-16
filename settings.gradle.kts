@@ -19,3 +19,4 @@ dependencyResolutionManagement {
 rootProject.name = "dkrepo"
 
 include(":ReAnime")
+include(":MoviesWood")

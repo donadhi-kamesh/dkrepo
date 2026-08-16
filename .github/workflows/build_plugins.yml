@@ -40,6 +40,7 @@ jobs:
           mkdir -p build/staging
           cp build/plugins.json build/staging/plugins.json
           cp ReAnime/build/ReAnime.cs3 build/staging/ReAnime.cs3
+          cp MoviesWood/build/MoviesWood.cs3 build/staging/MoviesWood.cs3
           # Cache-bust plugin download URLs so Cloudstream/CDNs cannot serve a stale .cs3
           # against a newer plugins.json (common cause of "download failed" / fileHash errors).
           python3 - <<'PY'

@@ -20,6 +20,20 @@ This is a custom extension repository for [Cloudstream 3](https://github.com/rec
 
 ---
 
+### 2. **MoviesWood** (`MoviesWood`)
+- **Site**: [https://movieswood.cloud](https://movieswood.cloud)
+- **Content**: Telugu / Tamil / Hindi / Malayalam / Dubbed movies, Web Series & TV Shows (direct download links)
+- **Language**: Multi (Indian languages + English dubs)
+- **Features**:
+  - Home sections per category (Tamil, Telugu Dubbed, English, Hindi, Malayalam, Web Series, TV Shows)
+  - Site-wide search across all categories (search is per-category on the site, fanned out in parallel)
+  - TMDB posters, year, rating & synopsis on the info page
+  - Every file on the site (1080p / 720p / 700MB …) exposed as a playable/downloadable link
+  - Season/episode detection for web series (S03 EP02 → episode list)
+- **Note**: the site only serves content to mobile user agents; the extension always sends a mobile UA.
+
+---
+
 ## 📱 How to Add to Cloudstream 3
 
 1. Open **Cloudstream 3** on your Android device.
@@ -29,7 +43,7 @@ This is a custom extension repository for [Cloudstream 3](https://github.com/rec
    ```text
    https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/repo.json
    ```
-5. Click **Add** and install **Re:ANIME** from the extensions list!
+5. Click **Add** and install **Re:ANIME** or **MoviesWood** from the extensions list!
 
 If Cloudstream still shows an old version (e.g. v12) or download fails:
 1. Remove the **dkrepo** repository from Extensions.
