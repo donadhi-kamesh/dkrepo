@@ -9,6 +9,8 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jsoup.Jsoup
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -186,13 +188,59 @@ class TamilMVProvider : MainAPI() {
         return seen.values.sortedByDescending { it.id }
     }
 
-    private fun rowToSearch(row: TopicRow): SearchResponse? {
+    /** first offsite image in a post = poster (topics lead with a poster/screenshot) */
+    private fun firstImage(post: org.jsoup.nodes.Element): String? =
+        post.select("img[src]")
+            .map { it.attr("abs:src") }
+            .firstOrNull {
+                it.contains("pixelbb") ||
+                    (!it.contains("/uploads/") && Regex("""\.(jpe?g|png|webp)""", RegexOption.IGNORE_CASE).containsMatchIn(it))
+            }
+
+    private val posterCache = Collections.synchronizedMap(HashMap<Long, String?>())
+
+    /**
+     * Poster for a topic: first image in its first post. Cached per topic id
+     * (including misses) so home pages don't refetch the same topics.
+     */
+    private suspend fun posterFor(row: TopicRow): String? {
+        posterCache[row.id]?.let { return it }
+        if (posterCache.containsKey(row.id)) return null
+        val m = TOPIC_PATH_REGEX.find(row.url) ?: return null
+        return try {
+            val html = siteGet("/index.php?/forums/topic/${m.groupValues[1]}-${m.groupValues[2]}/")
+            val doc = Jsoup.parse(html)
+            val post = doc.selectFirst("[itemprop=commentText], .cPost_contentWrap") ?: doc.body()
+            val poster = firstImage(post)
+            posterCache[row.id] = poster
+            poster
+        } catch (e: Exception) {
+            Log.d("TamilMV", "poster fetch failed ${row.id}: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun rowsToSearchResponses(rows: List<TopicRow>): List<SearchResponse> =
+        coroutineScope {
+            val gate = Semaphore(6)
+            rows.map { row ->
+                async {
+                    gate.withPermit {
+                        rowToSearch(row)
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+
+    private suspend fun rowToSearch(row: TopicRow): SearchResponse? {
         val (title, year) = cleanTitle(row.title)
         val isSeries = EP_SEASON_EP.containsMatchIn(row.title.lowercase()) ||
             EP_WORD_ONLY.containsMatchIn(row.title.lowercase())
         val type = if (isSeries) TvType.TvSeries else TvType.Movie
+        val poster = posterFor(row)
         return newMovieSearchResponse(title, row.url, type) {
             this.year = year
+            this.posterUrl = poster
         }
     }
 
@@ -208,7 +256,7 @@ class TamilMVProvider : MainAPI() {
         val items = try {
             if (request.data == "latest") {
                 if (page > 1) emptyList()
-                else parseTopicRows(siteGet("/index.php"), d).mapNotNull { rowToSearch(it) }
+                else rowsToSearchResponses(parseTopicRows(siteGet("/index.php"), d))
             } else {
                 val subforums = subforumsFor(request.data)
                 coroutineScope {
@@ -218,7 +266,7 @@ class TamilMVProvider : MainAPI() {
                 }
                     .distinctBy { it.id }
                     .sortedByDescending { it.id }
-                    .mapNotNull { rowToSearch(it) }
+                    .let { rowsToSearchResponses(it) }
             }
         } catch (e: Exception) {
             Log.w("TamilMV", "getMainPage failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -247,8 +295,9 @@ class TamilMVProvider : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         return try {
             // IPS needs the pathinfo-style query: /search/&q=... (a leading ? is ignored for guests)
-            parseTopicRows(siteGet("/index.php?/search/&q=$encoded"), d, searchMode = true)
-                .mapNotNull { rowToSearch(it) }
+            rowsToSearchResponses(
+                parseTopicRows(siteGet("/index.php?/search/&q=$encoded"), d, searchMode = true)
+            )
         } catch (e: Exception) {
             Log.w("TamilMV", "search failed: ${e.message}")
             emptyList()
@@ -281,10 +330,9 @@ class TamilMVProvider : MainAPI() {
 
         val post = doc.selectFirst("[itemprop=commentText], .cPost_contentWrap") ?: doc.body()
 
-        // poster: first offsite screenshot in the post (pixelbb and friends)
-        val poster = post.select("img[src]")
-            .map { it.attr("abs:src") }
-            .firstOrNull { it.contains("pixelbb") || (!it.contains("/uploads/") && it.contains(Regex("""\.(jpe?g|png|webp)""", RegexOption.IGNORE_CASE))) }
+        // poster: first offsite image in the first post (topics lead with a poster)
+        val poster = firstImage(post)
+        m.groupValues[1].toLongOrNull()?.let { posterCache[it] = poster }
 
         // variants: posts interleave MAGNET anchors (dn=/xl= label the file) with
         // DIRECT LINK buttons. Pair each direct button with the nearest unpaired
