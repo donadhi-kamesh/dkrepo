@@ -67,6 +67,11 @@ class TamilMVProvider : MainAPI() {
         private val mapper = jacksonObjectMapper()
 
         private val TOPIC_PATH_REGEX = Regex("""/forums/topic/(\d+)-([^/?#]*)/?""")
+
+        /** only the newest N rows of a section get a live poster fetch; the rest use cache only */
+        private const val POSTER_ROW_LIMIT = 18
+        private const val POSTER_FETCH_TIMEOUT_MS = 3500L
+        private const val POSTER_SECTION_BUDGET_MS = 8000L
         private val OUT_LINK_REGEX = Regex("""https?://[^"'\s<>]+/out\?t=[^"'\s<>]+""")
         private val CDN_LINK_REGEX = Regex("""https?://cdn\.[A-Za-z0-9.-]+/files/[^\s"'<>]+""")
 
@@ -131,6 +136,8 @@ class TamilMVProvider : MainAPI() {
                 cachedDomain = finalHost
                 Log.i("TamilMV", "resolved domain -> $finalHost (via $host)")
                 return finalHost
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.d("TamilMV", "domain candidate $host failed: ${e.message}")
             }
@@ -138,11 +145,15 @@ class TamilMVProvider : MainAPI() {
         throw ErrorLoadingException("No live 1TamilMV domain found in ${DOMAIN_CANDIDATES.size} candidates")
     }
 
-    /** GET with one retry after re-resolving the domain (handles rotations mid-session). */
+    /** GET with one retry after re-resolving the domain (handles rotations mid-session).
+     *  Coroutine cancellation (Cloudstream request timeout) is rethrown - treating it
+     *  as a domain failure caused a candidate-walk storm and blank pages. */
     private suspend fun siteGet(path: String): String {
         val d = domain()
         try {
             return rawGet("https://$d$path")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             cachedDomain = null
             Log.w("TamilMV", "request failed on $d, re-resolving: ${e.message}")
@@ -199,45 +210,68 @@ class TamilMVProvider : MainAPI() {
 
     private val posterCache = Collections.synchronizedMap(HashMap<Long, String?>())
 
+    /** shared across all sections so parallel section loads can't hammer the forum */
+    private val posterGate = Semaphore(6)
+
     /**
      * Poster for a topic: first image in its first post. Cached per topic id
-     * (including misses) so home pages don't refetch the same topics.
+     * (including misses) so home pages don't refetch the same topics. Each fetch
+     * is bounded so one slow topic can never stall (and timeout) a whole section.
      */
     private suspend fun posterFor(row: TopicRow): String? {
         posterCache[row.id]?.let { return it }
         if (posterCache.containsKey(row.id)) return null
         val m = TOPIC_PATH_REGEX.find(row.url) ?: return null
-        return try {
-            val html = siteGet("/index.php?/forums/topic/${m.groupValues[1]}-${m.groupValues[2]}/")
-            val doc = Jsoup.parse(html)
-            val post = doc.selectFirst("[itemprop=commentText], .cPost_contentWrap") ?: doc.body()
-            val poster = firstImage(post)
-            posterCache[row.id] = poster
-            poster
+        val poster = try {
+            kotlinx.coroutines.withTimeoutOrNull(POSTER_FETCH_TIMEOUT_MS) {
+                posterGate.withPermit {
+                    val html = siteGet("/index.php?/forums/topic/${m.groupValues[1]}-${m.groupValues[2]}/")
+                    val doc = Jsoup.parse(html)
+                    val post = doc.selectFirst("[itemprop=commentText], .cPost_contentWrap") ?: doc.body()
+                    firstImage(post)
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.d("TamilMV", "poster fetch failed ${row.id}: ${e.message}")
             null
         }
+        posterCache[row.id] = poster
+        return poster
     }
 
+    /**
+     * Build search responses, fetching posters in small batches under a per-section
+     * deadline: slow topics ship posterless instead of stalling the section until
+     * Cloudstream cancels it.
+     */
     private suspend fun rowsToSearchResponses(rows: List<TopicRow>): List<SearchResponse> =
-        coroutineScope {
-            val gate = Semaphore(6)
-            rows.map { row ->
+    coroutineScope {
+        val deadline = System.currentTimeMillis() + POSTER_SECTION_BUDGET_MS
+        val out = mutableListOf<SearchResponse>()
+        rows.chunked(6).forEachIndexed { chunkIdx, chunk ->
+            val allowFetch = chunkIdx * 6 < POSTER_ROW_LIMIT && System.currentTimeMillis() < deadline
+            val responses = chunk.map { row ->
                 async {
-                    gate.withPermit {
-                        rowToSearch(row)
+                    val poster = when {
+                        posterCache.containsKey(row.id) -> posterCache[row.id]
+                        allowFetch -> posterFor(row)
+                        else -> null
                     }
+                    rowToSearch(row, poster)
                 }
-            }.awaitAll().filterNotNull()
+            }.awaitAll()
+            out.addAll(responses.filterNotNull())
         }
+        out
+    }
 
-    private suspend fun rowToSearch(row: TopicRow): SearchResponse? {
+    private fun rowToSearch(row: TopicRow, poster: String?): SearchResponse? {
         val (title, year) = cleanTitle(row.title)
         val isSeries = EP_SEASON_EP.containsMatchIn(row.title.lowercase()) ||
             EP_WORD_ONLY.containsMatchIn(row.title.lowercase())
         val type = if (isSeries) TvType.TvSeries else TvType.Movie
-        val poster = posterFor(row)
         return newMovieSearchResponse(title, row.url, type) {
             this.year = year
             this.posterUrl = poster
