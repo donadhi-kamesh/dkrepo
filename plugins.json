@@ -44,10 +44,10 @@
     },
     {
         "iconUrl": "https://www.google.com/s2/favicons?sz=64&domain=1tamilmv.ing",
-        "fileHash": "sha256-9c6783a58bab85c54ae9cd1b1353b6e4329fa6ef9dc78a933dfa9ce253a48d12",
+        "fileHash": "sha256-ee29f2f54b5eb59aeab5421a9c82b043a56527bec0e17c961072f617d0aaa93a",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/donadhi-kamesh/dkrepo",
-        "fileSize": 30137,
+        "fileSize": 32600,
         "status": 1,
         "language": "ta",
         "authors": [
@@ -57,10 +57,10 @@
             "Movie",
             "TvSeries"
         ],
-        "version": 1,
+        "version": 2,
         "internalName": "TamilMV",
         "description": "1TamilMV extension - Tamil/Telugu/Hindi/Malayalam/Kannada/English movies & web series with direct download links",
-        "url": "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/TamilMV.cs3?v=1",
+        "url": "https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/TamilMV.cs3?v=2",
         "name": "TamilMV"
     }
 ]
