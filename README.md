@@ -34,6 +34,19 @@ This is a custom extension repository for [Cloudstream 3](https://github.com/rec
 
 ---
 
+### 3. **1TamilMV** (`TamilMV`)
+- **Site**: [https://www.1tamilmv.ing](https://www.1tamilmv.ing) (domain rotates often)
+- **Content**: Tamil / Telugu / Hindi / Malayalam / Kannada / English movies & web series (forum)
+- **Features**:
+  - Automatic current-domain resolution from a candidate list (survives domain rotation)
+  - Latest + per-language home sections (Web-HD, HD-Rips, Web Series, PreDVD subforums)
+  - Forum search
+  - Direct download links only (magnets ignored): shortlink -> file page -> CDN chain resolved at play time
+  - Series episode detection from file names (S03 EP02 -> episode list)
+- **Note**: sends a mobile user agent on every request.
+
+---
+
 ## 📱 How to Add to Cloudstream 3
 
 1. Open **Cloudstream 3** on your Android device.
@@ -43,7 +56,7 @@ This is a custom extension repository for [Cloudstream 3](https://github.com/rec
    ```text
    https://raw.githubusercontent.com/donadhi-kamesh/dkrepo/gh-pages/repo.json
    ```
-5. Click **Add** and install **Re:ANIME** or **MoviesWood** from the extensions list!
+5. Click **Add** and install **Re:ANIME**, **MoviesWood** or **1TamilMV** from the extensions list!
 
 If Cloudstream still shows an old version (e.g. v12) or download fails:
 1. Remove the **dkrepo** repository from Extensions.
